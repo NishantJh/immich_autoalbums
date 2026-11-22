@@ -247,6 +247,7 @@ export interface DashboardBootstrap {
   settings: OrganizerSettings;
   clusters: ClusterRecord[];
   assets: AssetRecord[];
+  totalAssetCount?: number;
   pipelineSummary: PipelineRunSummary | null;
   syncHistory: SyncHistoryRecord[];
 }
@@ -273,6 +274,8 @@ export interface PullProgressState {
   total: number;
   cachedCount: number;
   ingestedCount: number;
+  dbAssetCount?: number;
+  etaSeconds?: number | null;
   cancelRequested: boolean;
   startedAt: string | null;
   updatedAt: string;

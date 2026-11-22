@@ -39,7 +39,7 @@ interface ReviewQueueViewProps {
   onBatchRename: (updates: Array<{ id: string; title: string }>) => Promise<boolean>;
   onStatusChange: (id: string, status: 'pending' | 'approved' | 'discarded') => Promise<void>;
   onSyncOne: (id: string) => Promise<void>;
-  onMerge: (ids: string[], title?: string) => Promise<void>;
+  onMerge: (ids: string[], title?: string, keepOriginals?: boolean) => Promise<void>;
   onSplit: (id: string, splitIndex: number) => Promise<void>;
   onOpenLibrary?: () => void;
 }
@@ -109,6 +109,7 @@ export function ReviewQueueView({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [mergeTitle, setMergeTitle] = useState('');
+  const [keepOriginalsOnMerge, setKeepOriginalsOnMerge] = useState(false);
   const [inspectClusterId, setInspectClusterId] = useState<string | null>(null);
 
   // Timeline-nearby rename propagation session
@@ -254,11 +255,106 @@ export function ReviewQueueView({
     }
   };
 
+  // Detect groups of 2+ active albums that share the same event / place base (e.g. 13 Kalimpong Trip albums)
+  const mergeableGroups = useMemo(() => {
+    const active = clusters.filter((c) => c.status !== 'discarded');
+    const normalizeBase = (c: ClusterRecord): { key: string; label: string } => {
+      const stripped = c.title
+        .replace(/^\d{4}-\d{2}\s*[•·-]\s*/, '')
+        .replace(/\s+—\s+.+$/, '')
+        .replace(/\s*\(All\)$/i, '')
+        .replace(/\s*\(Merged\)$/i, '')
+        .replace(/\s+#\d+$/, '')
+        .replace(/\s+Part\s+\d+$/i, '')
+        .trim();
+      const base = (c.parentEventName || stripped || c.locationLabel || 'Untitled').trim();
+      const ym = (c.startDate || '').slice(0, 7);
+      return {
+        key: `${ym}::${base.toLowerCase()}`,
+        label: base,
+      };
+    };
+
+    const byKey = new Map<
+      string,
+      { key: string; label: string; ym: string; clusters: ClusterRecord[]; uniquePhotos: number }
+    >();
+    for (const c of active) {
+      const { key, label } = normalizeBase(c);
+      const existing = byKey.get(key);
+      if (existing) {
+        existing.clusters.push(c);
+      } else {
+        byKey.set(key, {
+          key,
+          label,
+          ym: (c.startDate || '').slice(0, 7),
+          clusters: [c],
+          uniquePhotos: 0,
+        });
+      }
+    }
+
+    return Array.from(byKey.values())
+      .filter((g) => g.clusters.length >= 2)
+      .map((g) => {
+        const photoSet = new Set<string>();
+        for (const c of g.clusters) {
+          for (const aid of c.assetIds) photoSet.add(aid);
+        }
+        return { ...g, uniquePhotos: photoSet.size };
+      })
+      .sort((a, b) => b.clusters.length - a.clusters.length || b.uniquePhotos - a.uniquePhotos)
+      .slice(0, 6);
+  }, [clusters]);
+
+  const selectedClusters = useMemo(
+    () => clusters.filter((c) => selectedIds.includes(c.id)),
+    [clusters, selectedIds]
+  );
+
+  const selectedUniquePhotoCount = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of selectedClusters) {
+      for (const id of c.assetIds) set.add(id);
+    }
+    return set.size;
+  }, [selectedClusters]);
+
+  const suggestedMergeTitle = useMemo(() => {
+    if (selectedClusters.length < 2) return '';
+    const sorted = [...selectedClusters].sort(
+      (a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime()
+    );
+    const strip = (t: string) =>
+      t
+        .replace(/\s+—\s+.+$/, '')
+        .replace(/\s*\(All\)$/i, '')
+        .replace(/\s*\(Merged\)$/i, '')
+        .replace(/\s+#\d+$/, '')
+        .trim();
+    const first = strip(sorted[0].title);
+    const allSame = sorted.every((c) => strip(c.title).toLowerCase() === first.toLowerCase());
+    return allSame && first ? first : `${first} (Merged)`;
+  }, [selectedClusters]);
+
+  const handleSelectGroup = (groupClusters: ClusterRecord[], suggestedTitle: string) => {
+    setSelectedIds(groupClusters.map((c) => c.id));
+    setMergeTitle(suggestedTitle);
+    setKeepOriginalsOnMerge(false);
+  };
+
+  const handleSelectAllFiltered = () => {
+    const activeFiltered = filteredClusters.filter((c) => c.status !== 'discarded');
+    setSelectedIds(activeFiltered.map((c) => c.id));
+  };
+
   const handleMergeSubmit = async () => {
     if (selectedIds.length < 2) return;
-    await onMerge(selectedIds, mergeTitle.trim() || undefined);
+    await onMerge(selectedIds, mergeTitle.trim() || undefined, keepOriginalsOnMerge);
     setSelectedIds([]);
     setMergeTitle('');
+    setKeepOriginalsOnMerge(false);
   };
 
   const counts = useMemo(
@@ -309,27 +405,67 @@ export function ReviewQueueView({
           })}
         </div>
 
-        <div className="relative w-full xl:w-72 shrink-0">
-          <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400 dark:text-zinc-500" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search title, city, or mood..."
-            className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] pl-9 pr-8 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
-          />
-          {query && (
+        <div className="flex items-center gap-2 w-full xl:w-auto shrink-0">
+          <div className="relative flex-1 xl:w-72">
+            <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400 dark:text-zinc-500" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search title, city, or mood..."
+              className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] pl-9 pr-8 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery('')}
+                aria-label="Clear search"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+
+          {filteredClusters.filter((c) => c.status !== 'discarded').length >= 2 && (
             <button
               type="button"
-              onClick={() => setQuery('')}
-              aria-label="Clear search"
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+              onClick={handleSelectAllFiltered}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] px-3 py-2 text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-white/[0.05] transition-colors whitespace-nowrap shrink-0 tabular-nums"
+              title="Select all visible albums to merge them"
             >
-              <X className="h-3.5 w-3.5" />
+              <GitMerge className="h-3.5 w-3.5 text-indigo-600 dark:text-indigo-400" />
+              Select {filteredClusters.filter((c) => c.status !== 'discarded').length}
             </button>
           )}
         </div>
       </div>
+
+      {/* Quick Merge Suggestions for Split / Related Album Groups (e.g. 13 Kalimpong Trip albums) */}
+      {mergeableGroups.length > 0 && selectedIds.length === 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] px-4 py-3">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-300 mr-1">
+            <GitMerge className="h-3.5 w-3.5 text-indigo-600 dark:text-indigo-400 shrink-0" />
+            <span>Merge related albums:</span>
+          </div>
+          {mergeableGroups.map((group) => {
+            const defaultTitle = group.ym ? `${group.ym} • ${group.label}` : group.label;
+            return (
+              <button
+                key={group.key}
+                type="button"
+                onClick={() => handleSelectGroup(group.clusters, defaultTitle)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200/90 dark:border-white/[0.10] bg-zinc-50 dark:bg-[#171B24] px-2.5 py-1 text-xs font-medium text-zinc-800 dark:text-zinc-200 hover:border-indigo-400 dark:hover:border-indigo-500/60 hover:text-indigo-700 dark:hover:text-indigo-300 transition-colors"
+              >
+                <span className="truncate max-w-[180px]">{group.label}</span>
+                <span className="font-mono text-[11px] tabular-nums text-indigo-600 dark:text-indigo-400">
+                  {group.clusters.length} albums
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* Timeline-Nearby Rename Suggestions Panel */}
       {renameSession && (
@@ -522,47 +658,69 @@ export function ReviewQueueView({
         </div>
       )}
 
-      {/* Merge Selection Bar */}
+      {/* Sticky Merge Selection Bar */}
       {selectedIds.length > 0 && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200 dark:border-indigo-500/30 bg-indigo-50/70 dark:bg-indigo-950/30 px-5 py-3.5">
-          <div className="text-sm text-indigo-950 dark:text-indigo-200">
-            <span className="font-semibold font-mono tabular-nums">{selectedIds.length}</span>{' '}
-            {selectedIds.length === 1
-              ? 'cluster selected — select another to merge'
-              : 'clusters selected for merge'}
+        <div className="sticky top-3 z-20 rounded-xl border border-indigo-300/90 dark:border-indigo-500/40 bg-white/95 dark:bg-[#111521]/95 backdrop-blur-md shadow-sm px-5 py-3.5 space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-sm text-zinc-900 dark:text-zinc-100">
+              <span className="font-semibold font-mono tabular-nums text-indigo-600 dark:text-indigo-400">
+                {selectedIds.length}
+              </span>{' '}
+              {selectedIds.length === 1
+                ? 'album selected — select at least one more to merge'
+                : `albums selected · ${selectedUniquePhotoCount.toLocaleString()} unique photos`}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {selectedIds.length >= 2 && (
+                <>
+                  <input
+                    type="text"
+                    value={mergeTitle}
+                    onChange={(e) => setMergeTitle(e.target.value)}
+                    placeholder={suggestedMergeTitle || 'Merged album title (optional)'}
+                    className="w-64 rounded-lg border border-zinc-200 dark:border-white/[0.12] bg-white dark:bg-[#0A0C10] px-3 py-1.5 text-xs text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={busyId === 'merge'}
+                    onClick={handleMergeSubmit}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap shrink-0 transition-colors tabular-nums"
+                  >
+                    <GitMerge className="h-3.5 w-3.5" />
+                    {busyId === 'merge' ? 'Merging...' : `Merge ${selectedIds.length} Albums`}
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedIds([]);
+                  setMergeTitle('');
+                  setKeepOriginalsOnMerge(false);
+                }}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200/60 dark:hover:bg-white/[0.06] whitespace-nowrap shrink-0 transition-colors"
+              >
+                Clear
+              </button>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {selectedIds.length >= 2 && (
-              <>
+
+          {selectedIds.length >= 2 && (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 dark:border-white/[0.06] pt-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+              <label className="inline-flex items-center gap-2 cursor-pointer select-none text-zinc-700 dark:text-zinc-300">
                 <input
-                  type="text"
-                  value={mergeTitle}
-                  onChange={(e) => setMergeTitle(e.target.value)}
-                  placeholder="Optional merged album title"
-                  className="w-56 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-white dark:bg-[#0D1017] px-3 py-1.5 text-xs text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  type="checkbox"
+                  checked={keepOriginalsOnMerge}
+                  onChange={(e) => setKeepOriginalsOnMerge(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-zinc-300 text-indigo-600 focus:ring-indigo-500"
                 />
-                <button
-                  type="button"
-                  disabled={busyId === 'merge'}
-                  onClick={handleMergeSubmit}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap shrink-0 transition-colors"
-                >
-                  <GitMerge className="h-3.5 w-3.5" />
-                  Merge Selected
-                </button>
-              </>
-            )}
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedIds([]);
-                setMergeTitle('');
-              }}
-              className="rounded-lg px-3 py-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200/60 dark:hover:bg-white/[0.06] whitespace-nowrap shrink-0 transition-colors"
-            >
-              Clear
-            </button>
-          </div>
+                <span>Keep original color-tone chapters as separate albums</span>
+              </label>
+              <span>
+                Combines only selected albums &amp; recomputes CIELAB palette. Unselected color albums stay untouched.
+              </span>
+            </div>
+          )}
         </div>
       )}
 
@@ -764,6 +922,19 @@ export function ReviewQueueView({
                   <div className="mt-auto pt-5">
                     <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 dark:border-white/[0.06] pt-3.5">
                       <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => toggleSelect(cluster.id)}
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                            isSelected
+                              ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-950/50 text-indigo-700 dark:text-indigo-300'
+                              : 'border-zinc-200 dark:border-white/[0.10] text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-white/[0.05]'
+                          }`}
+                        >
+                          <GitMerge className="h-3.5 w-3.5" />
+                          {isSelected ? 'Selected' : 'Merge'}
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => setInspectClusterId(cluster.id)}

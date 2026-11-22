@@ -8,10 +8,11 @@ import {
 } from './src/server/colorLab.ts';
 import {
   clearLocalLibraryCache,
-  getAllAssets,
   getAllClusters,
+  getAssetCount,
   getDb,
   getPipelineSummary,
+  getRecentAssets,
   getSettings,
   getSyncHistory,
   purgeDemoAssets,
@@ -69,7 +70,8 @@ async function startServer() {
         immichStatus,
         settings: getSettings(),
         clusters: getAllClusters(true),
-        assets: getAllAssets(),
+        assets: getRecentAssets(600),
+        totalAssetCount: getAssetCount(),
         pipelineSummary: getPipelineSummary(),
         syncHistory: getSyncHistory(),
       });
@@ -131,12 +133,13 @@ async function startServer() {
       try {
         const result = await ingestFromLiveImmich(options);
         const run = runFullPipeline();
+        const totalIndexed = getAssetCount();
         const suffix = result.cancelled
-          ? ' (stopped early — clustered photos pulled so far)'
+          ? ' (stopped early — clustered all photos saved so far)'
           : '';
         finishPullProgress(
-          `Indexed ${result.ingested.toLocaleString()} photos into ${run.clusters.length} album proposals in ${run.summary.durationMs} ms${suffix}.`,
-          result.ingested
+          `Indexed ${totalIndexed.toLocaleString()} photos (${run.summary.stage1.eligibleAssets.toLocaleString()} eligible) into ${run.clusters.length} album proposals in ${run.summary.durationMs} ms${suffix}.`,
+          totalIndexed
         );
       } catch (err) {
         failPullProgress(err instanceof Error ? err.message : 'Immich ingestion failed');
@@ -322,7 +325,7 @@ async function startServer() {
       }
 
       const run = runFullPipeline();
-      res.json({ inserted, ...run, assets: getAllAssets() });
+      res.json({ inserted, ...run, assets: getRecentAssets(600), totalAssetCount: getAssetCount() });
     } catch (err) {
       res.status(400).json({
         error: err instanceof Error ? err.message : 'Failed to ingest uploaded photos',
@@ -334,7 +337,13 @@ async function startServer() {
   app.post('/api/library/clear', (_req, res) => {
     const cleared = clearLocalLibraryCache();
     const run = runFullPipeline();
-    res.json({ cleared, ...run, assets: getAllAssets(), syncHistory: getSyncHistory() });
+    res.json({
+      cleared,
+      ...run,
+      assets: getRecentAssets(600),
+      totalAssetCount: getAssetCount(),
+      syncHistory: getSyncHistory(),
+    });
   });
 
   // Run 4-Stage Clustering & CIELAB Scene-Split Pipeline (pulls from live Immich when connected)
@@ -355,7 +364,8 @@ async function startServer() {
       const run = runFullPipeline();
       res.json({
         ...run,
-        assets: getAllAssets(),
+        assets: getRecentAssets(600),
+        totalAssetCount: getAssetCount(),
         immichStatus,
         ingested: 0,
         mode: immichStatus.configured ? 'local_fallback' : 'local_cache',
@@ -529,12 +539,18 @@ async function startServer() {
   // Merge selected clusters
   app.post('/api/clusters/merge', (req, res) => {
     try {
-      const { clusterIds, title } = req.body as { clusterIds?: string[]; title?: string };
+      const { clusterIds, title, keepOriginals } = req.body as {
+        clusterIds?: string[];
+        title?: string;
+        keepOriginals?: boolean;
+      };
       if (!Array.isArray(clusterIds) || clusterIds.length < 2) {
         res.status(400).json({ error: 'Select at least 2 clusters to merge.' });
         return;
       }
-      const merged = mergeClusters(clusterIds.map(String), title);
+      const merged = mergeClusters(clusterIds.map(String), title, {
+        keepOriginals: Boolean(keepOriginals),
+      });
       res.json({ merged, clusters: getAllClusters(true) });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Merge failed' });
@@ -678,7 +694,8 @@ async function startServer() {
           ? {
               summary: pipeline.summary,
               clusters: pipeline.clusters,
-              assets: getAllAssets(),
+              assets: getRecentAssets(600),
+              totalAssetCount: getAssetCount(),
             }
           : {}),
       });

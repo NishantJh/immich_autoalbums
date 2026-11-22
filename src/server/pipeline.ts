@@ -507,6 +507,11 @@ export function runFullPipeline(): {
   `);
 
   const eligible: EnrichedAsset[] = [];
+  const excludedRulePairs = settings.excludedPaths
+    .map((rule) => ({ raw: rule, lower: rule.toLowerCase() }))
+    .filter((r) => r.lower.length > 0);
+  const filterUpdates: Array<[number, string | null, string]> = [];
+  const labUpdates: Array<[number, number, number, number, string, string, string]> = [];
 
   for (const row of allRows) {
     const a = row.asset;
@@ -519,23 +524,22 @@ export function runFullPipeline(): {
     } else if (a.isAlreadyAlbumed) {
       excludedAlreadyAlbumed++;
       reason = 'Already in manual album';
-    } else if (
-      settings.excludedPaths.some((rule) =>
-        a.originalPath.toLowerCase().includes(rule.toLowerCase())
-      )
-    ) {
-      excludedByPathRule++;
-      const matched = settings.excludedPaths.find((rule) =>
-        a.originalPath.toLowerCase().includes(rule.toLowerCase())
-      );
-      reason = `Excluded path rule (${matched})`;
-    } else if (settings.ignoreScreenshots && isSuspectedScreenshot(a)) {
-      excludedScreenshots++;
-      shot = true;
-      reason = 'Suspected screenshot (no camera EXIF + screen aspect ratio)';
+    } else {
+      const lowerPath = a.originalPath.toLowerCase();
+      const matchedRule = excludedRulePairs.find((r) => lowerPath.includes(r.lower));
+      if (matchedRule) {
+        excludedByPathRule++;
+        reason = `Excluded path rule (${matchedRule.raw})`;
+      } else if (settings.ignoreScreenshots && isSuspectedScreenshot(a)) {
+        excludedScreenshots++;
+        shot = true;
+        reason = 'Suspected screenshot (no camera EXIF + screen aspect ratio)';
+      }
     }
 
-    updateFilterStmt.run(shot ? 1 : 0, reason, a.id);
+    if (shot !== a.isScreenshot || reason !== a.excludedReason) {
+      filterUpdates.push([shot ? 1 : 0, reason, a.id]);
+    }
     if (reason) continue;
 
     // Feature Cache check: reuse cached CIELAB histogram & 5-color palette if present
@@ -561,15 +565,15 @@ export function runFullPipeline(): {
             histogram = extracted.histogram;
             avgLab = extracted.avgLab;
             palette = extracted.palette;
-            updateLabStmt.run(
+            labUpdates.push([
               avgLab.l,
               avgLab.a,
               avgLab.b,
               avgLab.chroma,
               JSON.stringify(histogram),
               JSON.stringify(palette),
-              a.id
-            );
+              a.id,
+            ]);
             newlyExtracted++;
           } catch {
             // Unsupported or corrupt thumbnail buffer falls back cleanly below
@@ -596,6 +600,17 @@ export function runFullPipeline(): {
       palette,
       timestampMs: new Date(a.localDateTime).getTime(),
     });
+  }
+
+  if (filterUpdates.length > 0 || labUpdates.length > 0) {
+    db.transaction(() => {
+      for (const u of filterUpdates) {
+        updateFilterStmt.run(u[0], u[1], u[2]);
+      }
+      for (const u of labUpdates) {
+        updateLabStmt.run(u[0], u[1], u[2], u[3], u[4], u[5], u[6]);
+      }
+    })();
   }
 
   eligible.sort((x, y) => x.timestampMs - y.timestampMs);
@@ -1303,27 +1318,6 @@ export function runFullPipeline(): {
         compositeScore = Number((weightedScore / totalWeight).toFixed(3));
       }
 
-      const lastSplit = splitIndices.length > 0 ? splitIndices[splitIndices.length - 1] : 0;
-      const enoughBefore = i - lastSplit >= 4;
-      const enoughAfter = photos.length - i >= 4;
-      const isSplitBoundary =
-        settings.createMoodSubalbums &&
-        i > 0 &&
-        enoughBefore &&
-        enoughAfter &&
-        compositeScore >= settings.emdThreshold &&
-        gapMinutes >= settings.sceneSplitGapMins;
-
-      if (isSplitBoundary) {
-        splitIndices.push(i);
-        sceneSplitsDetected++;
-        if (activeSplitSignals.includes('Chroma') || activeSplitSignals.length === 0) signalUsage.chroma++;
-        if (activeSplitSignals.includes('Immich ML')) signalUsage.immichMl++;
-        if (activeSplitSignals.includes('GPS')) signalUsage.gps++;
-        if (activeSplitSignals.includes('Faces')) signalUsage.faces++;
-        if (activeSplitSignals.includes('EXIF')) signalUsage.exif++;
-      }
-
       points.push({
         index: i,
         assetId: photos[i].asset.id,
@@ -1335,17 +1329,77 @@ export function runFullPipeline(): {
         semanticShift,
         peopleShift,
         exifShift,
-        splitSignals: isSplitBoundary
-          ? activeSplitSignals.length > 0
-            ? activeSplitSignals
-            : ['Chroma']
-          : [],
+        splitSignals: activeSplitSignals.length > 0 ? activeSplitSignals : ['Chroma'],
         gapMinutes,
         labL: photos[i].avgLab.l,
         labB: photos[i].avgLab.b,
-        isSplitBoundary,
-        chapterIndex: splitIndices.length,
+        isSplitBoundary: false,
+        chapterIndex: 0,
       });
+    }
+
+    // Select up to 5 strongest local-maximum scene transitions with dynamic min chapter size
+    // so large trips never shatter into 10–20 tiny 4-photo chapters.
+    if (settings.createMoodSubalbums && photos.length >= 12) {
+      const minChapterSize = Math.max(6, Math.min(20, Math.round(photos.length * 0.12)));
+      const maxAutoSplits = 4; // up to 5 distinct chapters per event
+
+      const candidates: Array<{ index: number; score: number }> = [];
+      for (let i = minChapterSize; i <= photos.length - minChapterSize; i++) {
+        const pt = points[i];
+        const score = pt.compositeScore ?? pt.emdScore;
+        if (score < settings.emdThreshold || pt.gapMinutes < settings.sceneSplitGapMins) {
+          continue;
+        }
+        // Local peak check within ±3 frames so consecutive frames don't double-fire
+        let isPeak = true;
+        for (let j = Math.max(1, i - 3); j <= Math.min(photos.length - 1, i + 3); j++) {
+          if (j === i) continue;
+          const neighborScore = points[j].compositeScore ?? points[j].emdScore;
+          if (neighborScore > score || (neighborScore === score && j < i)) {
+            isPeak = false;
+            break;
+          }
+        }
+        if (isPeak) {
+          candidates.push({ index: i, score });
+        }
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const chosen: number[] = [];
+      for (const cand of candidates) {
+        if (chosen.length >= maxAutoSplits) break;
+        const tooClose = chosen.some((existing) => Math.abs(existing - cand.index) < minChapterSize);
+        if (!tooClose) {
+          chosen.push(cand.index);
+        }
+      }
+      chosen.sort((a, b) => a - b);
+
+      for (const idx of chosen) {
+        splitIndices.push(idx);
+        sceneSplitsDetected++;
+        const pt = points[idx];
+        pt.isSplitBoundary = true;
+        const sigs = pt.splitSignals || ['Chroma'];
+        if (sigs.includes('Chroma') || sigs.length === 0) signalUsage.chroma++;
+        if (sigs.includes('Immich ML')) signalUsage.immichMl++;
+        if (sigs.includes('GPS')) signalUsage.gps++;
+        if (sigs.includes('Faces')) signalUsage.faces++;
+        if (sigs.includes('EXIF')) signalUsage.exif++;
+      }
+    }
+
+    // Clear splitSignals on non-boundary points and stamp final chapterIndex
+    let chIdx = 0;
+    for (let i = 0; i < points.length; i++) {
+      if (points[i].isSplitBoundary) {
+        chIdx++;
+      } else {
+        points[i].splitSignals = [];
+      }
+      points[i].chapterIndex = chIdx;
     }
 
     // Build chapter slices
@@ -1586,14 +1640,22 @@ export function runFullPipeline(): {
 
 /**
  * Merges two or more selected clusters into one combined cluster in SQLite.
+ * Recomputes the combined 5-color CIELAB palette, mood, and multi-signal breakdown.
+ * When `keepOriginals` is true, original color-tone chapters remain intact alongside the combined album.
  */
-export function mergeClusters(clusterIds: string[], customTitle?: string): ClusterRecord {
+export function mergeClusters(
+  clusterIds: string[],
+  customTitle?: string,
+  options: { keepOriginals?: boolean } = {}
+): ClusterRecord {
   if (clusterIds.length < 2) {
     throw new Error('Select at least 2 clusters to merge.');
   }
   const db = getDb();
   const all = getAllClusters(true);
-  const selected = all.filter((c) => clusterIds.includes(c.id));
+  const selected = all
+    .filter((c) => clusterIds.includes(c.id))
+    .sort((a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime());
   if (selected.length < 2) {
     throw new Error('Selected clusters not found.');
   }
@@ -1622,40 +1684,89 @@ export function mergeClusters(clusterIds: string[], customTitle?: string): Clust
   };
   const mood = classifyAestheticMood(avgLab, mergedPalette);
 
+  const enrichedForSignals: EnrichedAsset[] = mergedAssets.map((a) => ({
+    asset: a,
+    histogram: {
+      l: new Array(12).fill(1 / 12),
+      a: new Array(12).fill(1 / 12),
+      b: new Array(12).fill(1 / 12),
+    },
+    avgLab: a.avgLab || { l: 50, a: 0, b: 0, chroma: 0 },
+    palette: a.palette || [],
+    timestampMs: new Date(a.localDateTime).getTime(),
+  }));
+  const mergedSignals = buildClusterSignalBreakdown(enrichedForSignals);
+  const mergedOccasion = pickTopOccasion(enrichedForSignals) || selected[0].occasionLabel;
+
   const primary = selected[0];
-  const mergedId = `merged-${Date.now()}`;
-  const mergedTitle = customTitle?.trim() || `${primary.title} (Merged)`;
-  const hash = deterministicHash(['merged', ...selected.map((s) => s.clusterHash).sort()]);
+  const mergedId = `merged-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+  // Derive a clean default title when user didn't type one
+  const stripSuffixes = (title: string) =>
+    title
+      .replace(/\s+—\s+.+$/, '')
+      .replace(/\s*\(All\)$/i, '')
+      .replace(/\s*\(Merged\)$/i, '')
+      .replace(/\s+#\d+$/, '')
+      .trim();
+
+  const baseTitles = selected.map((s) => stripSuffixes(s.title));
+  const sharedBase =
+    baseTitles.every((t) => t.toLowerCase() === baseTitles[0].toLowerCase()) && baseTitles[0]
+      ? baseTitles[0]
+      : null;
+
+  const mergedTitle =
+    customTitle?.trim() ||
+    (sharedBase
+      ? options.keepOriginals
+        ? `${sharedBase} (All)`
+        : sharedBase
+      : `${stripSuffixes(primary.title)} (Merged)`);
+
+  const hash = deterministicHash([
+    'merged',
+    options.keepOriginals ? 'keep' : 'replace',
+    ...selected.map((s) => s.clusterHash).sort(),
+  ]);
   const now = new Date().toISOString();
+  const nextType: ClusterRecord['clusterType'] = selected.every(
+    (s) => s.clusterType === 'local_event'
+  )
+    ? 'local_event'
+    : 'trip';
 
   db.transaction(() => {
-    const del = db.prepare('DELETE FROM clusters WHERE id = ?');
-    for (const s of selected) {
-      del.run(s.id);
+    if (!options.keepOriginals) {
+      const del = db.prepare('DELETE FROM clusters WHERE id = ?');
+      for (const s of selected) {
+        del.run(s.id);
+      }
     }
     db.prepare(`
       INSERT INTO clusters (
         id, cluster_hash, parent_event_id, parent_event_name, cluster_type,
         title, proposed_title, location_label, mood_label, occasion_label,
         start_date, end_date, palette_json, avg_lab_json, emd_boundary_score,
-        status, immich_album_id, synced_asset_count, asset_ids_json, emd_series_json, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, ?, '[]', ?)
+        signal_breakdown_json, status, immich_album_id, synced_asset_count, asset_ids_json, emd_series_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, ?, '[]', ?)
     `).run(
       mergedId,
       hash,
       primary.parentEventId,
       primary.parentEventName,
-      primary.clusterType === 'chapter' ? 'trip' : primary.clusterType,
+      nextType,
       mergedTitle,
       mergedTitle,
       primary.locationLabel,
       mood,
-      primary.occasionLabel,
+      mergedOccasion,
       mergedAssets[0]?.localDateTime || primary.startDate,
       mergedAssets[mergedAssets.length - 1]?.localDateTime || primary.endDate,
       JSON.stringify(mergedPalette),
       JSON.stringify(avgLab),
-      primary.emdBoundaryScore,
+      Math.max(...selected.map((s) => s.emdBoundaryScore), 0),
+      JSON.stringify(mergedSignals),
       JSON.stringify(mergedAssets.map((a) => a.id)),
       now
     );

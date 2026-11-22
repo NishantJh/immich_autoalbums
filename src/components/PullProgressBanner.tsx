@@ -47,6 +47,19 @@ function formatElapsed(startedAt: string | null, nowMs: number): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+function formatEta(etaSeconds: number | null | undefined): string | null {
+  if (typeof etaSeconds !== 'number' || !Number.isFinite(etaSeconds) || etaSeconds <= 0) {
+    return null;
+  }
+  if (etaSeconds < 60) return `~${Math.ceil(etaSeconds)}s left`;
+  const mins = Math.floor(etaSeconds / 60);
+  const secs = Math.round(etaSeconds % 60);
+  if (mins < 60) return secs > 0 ? `~${mins}m ${secs}s left` : `~${mins}m left`;
+  const hrs = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `~${hrs}h ${remMins}m left`;
+}
+
 export function PullProgressBanner({ progress, onCancel }: PullProgressBannerProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -59,6 +72,7 @@ export function PullProgressBanner({ progress, onCancel }: PullProgressBannerPro
 
   const currentOrder = phaseOrder(progress.phase);
   const clampedPct = Math.max(2, Math.min(100, progress.percent));
+  const etaLabel = formatEta(progress.etaSeconds);
 
   return (
     <section
@@ -86,6 +100,7 @@ export function PullProgressBanner({ progress, onCancel }: PullProgressBannerPro
           <div className="flex items-baseline gap-2.5 font-mono tabular-nums">
             <span className="text-xs text-zinc-400 dark:text-zinc-500">
               {formatElapsed(progress.startedAt, nowMs)}
+              {etaLabel ? ` · ${etaLabel}` : ''}
             </span>
             <span className="text-base font-semibold text-indigo-600 dark:text-indigo-400">
               {progress.percent}%

@@ -28,6 +28,7 @@ import { ThumbnailImage } from './ThumbnailImage.tsx';
 
 interface LibraryIngestViewProps {
   assets: AssetRecord[];
+  totalAssetCount: number;
   immichStatus: ImmichStatus;
   settings: OrganizerSettings;
   pullProgress: PullProgressState | null;
@@ -102,6 +103,7 @@ async function fileToThumbnail(file: File): Promise<{
 
 export function LibraryIngestView({
   assets,
+  totalAssetCount,
   immichStatus,
   settings,
   pullProgress,
@@ -636,19 +638,23 @@ export function LibraryIngestView({
               SQLite Asset &amp; Feature Cache
             </h2>
             <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
-              Showing {filtered.length.toLocaleString()} of{' '}
-              {Math.max(assets.length, pullProgress?.active ? (pullProgress.dbAssetCount ?? 0) : 0).toLocaleString()}{' '}
-              indexed assets
+              Showing {Math.min(filtered.length, 250).toLocaleString()} of{' '}
+              {Math.max(
+                totalAssetCount,
+                assets.length,
+                pullProgress?.active ? (pullProgress.dbAssetCount ?? 0) : 0
+              ).toLocaleString()}{' '}
+              indexed assets in SQLite
               {isPulling && pullProgress && (
                 <span className="ml-2 text-indigo-600 dark:text-indigo-400">
                   ·{' '}
-                  {pullProgress.phase === 'thumbnails'
-                    ? `Writing batches to SQLite (${pullProgress.current.toLocaleString()} / ${pullProgress.total.toLocaleString()} processed)`
-                    : pullProgress.phase === 'clustering'
-                      ? 'Running multi-signal clustering...'
-                      : pullProgress.phase === 'metadata' && pullProgress.current > 0
-                        ? `${pullProgress.current.toLocaleString()} photos discovered — SQLite updates once thumbnail batching starts`
-                        : 'Preparing full library pull...'}
+                  {pullProgress.phase === 'metadata' && pullProgress.current > 0
+                    ? `${pullProgress.current.toLocaleString()} saved so far (safe to Stop & Cluster anytime)`
+                    : pullProgress.phase === 'thumbnails'
+                      ? `Extracting CIELAB color (${pullProgress.current.toLocaleString()} / ${pullProgress.total.toLocaleString()})`
+                      : pullProgress.phase === 'clustering'
+                        ? 'Running multi-signal clustering...'
+                        : 'Syncing library from Immich...'}
                 </span>
               )}
             </p>

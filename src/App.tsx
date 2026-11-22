@@ -100,6 +100,7 @@ export default function App() {
   const [settings, setSettings] = useState<OrganizerSettings | null>(null);
   const [clusters, setClusters] = useState<ClusterRecord[]>([]);
   const [assets, setAssets] = useState<AssetRecord[]>([]);
+  const [totalAssetCount, setTotalAssetCount] = useState<number>(0);
   const [pipelineSummary, setPipelineSummary] = useState<PipelineRunSummary | null>(null);
   const [syncHistory, setSyncHistory] = useState<SyncHistoryRecord[]>([]);
 
@@ -135,6 +136,7 @@ export default function App() {
       setSettings(data.settings);
       setClusters(data.clusters);
       setAssets(data.assets);
+      setTotalAssetCount(data.totalAssetCount ?? data.pipelineSummary?.stage1.totalAssets ?? data.assets.length);
       setPipelineSummary(data.pipelineSummary);
       setSyncHistory(data.syncHistory);
     } catch (err) {
@@ -153,6 +155,7 @@ export default function App() {
       setSettings(data.settings);
       setClusters(data.clusters);
       setAssets(data.assets);
+      setTotalAssetCount(data.totalAssetCount ?? data.pipelineSummary?.stage1.totalAssets ?? data.assets.length);
       setPipelineSummary(data.pipelineSummary);
       setSyncHistory(data.syncHistory);
     } catch {
@@ -242,6 +245,7 @@ export default function App() {
         summary?: PipelineRunSummary;
         clusters?: ClusterRecord[];
         assets?: AssetRecord[];
+        totalAssetCount?: number;
       };
       if (!res.ok) throw new Error(data.error || 'Pipeline run failed');
 
@@ -262,6 +266,7 @@ export default function App() {
       if (data.summary) setPipelineSummary(data.summary);
       if (data.clusters) setClusters(data.clusters);
       if (data.assets) setAssets(data.assets);
+      if (typeof data.totalAssetCount === 'number') setTotalAssetCount(data.totalAssetCount);
 
       if (data.mode === 'local_fallback') {
         notify(
@@ -292,12 +297,14 @@ export default function App() {
         summary: PipelineRunSummary;
         clusters: ClusterRecord[];
         assets: AssetRecord[];
+        totalAssetCount?: number;
       };
       if (!res.ok) throw new Error(data.error || 'Pipeline re-extraction failed');
       if (data.immichStatus) setImmichStatus(data.immichStatus);
       setPipelineSummary(data.summary);
       setClusters(data.clusters);
       setAssets(data.assets);
+      if (typeof data.totalAssetCount === 'number') setTotalAssetCount(data.totalAssetCount);
       notify(
         `Re-extracted CIELAB features for ${data.summary.stage1.newlyExtracted} thumbnails in ${data.summary.durationMs} ms.`
       );
@@ -473,18 +480,22 @@ export default function App() {
     }
   };
 
-  const handleMerge = async (clusterIds: string[], title?: string) => {
+  const handleMerge = async (clusterIds: string[], title?: string, keepOriginals = false) => {
     setBusyId('merge');
     try {
       const res = await fetch('/api/clusters/merge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clusterIds, title }),
+        body: JSON.stringify({ clusterIds, title, keepOriginals }),
       });
       const data = (await res.json()) as { error?: string; clusters: ClusterRecord[] };
       if (!res.ok) throw new Error(data.error || 'Merge failed');
       setClusters(data.clusters);
-      notify(`Merged ${clusterIds.length} clusters and recomputed CIELAB palette.`);
+      notify(
+        keepOriginals
+          ? `Created combined album from ${clusterIds.length} albums while keeping original color-tone chapters.`
+          : `Merged ${clusterIds.length} albums into 1 unified album and recomputed its CIELAB palette.`
+      );
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Merge failed', 'err');
     } finally {
@@ -528,12 +539,14 @@ export default function App() {
         summary?: PipelineRunSummary;
         clusters?: ClusterRecord[];
         assets?: AssetRecord[];
+        totalAssetCount?: number;
       };
       if (!res.ok) throw new Error(data.error || 'Failed to save settings');
       setSettings(data.settings);
       if (data.summary) setPipelineSummary(data.summary);
       if (data.clusters) setClusters(data.clusters);
       if (data.assets) setAssets(data.assets);
+      if (typeof data.totalAssetCount === 'number') setTotalAssetCount(data.totalAssetCount);
       notify('Settings saved and pipeline refreshed.');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to save settings';
@@ -554,12 +567,14 @@ export default function App() {
         summary: PipelineRunSummary;
         clusters: ClusterRecord[];
         assets: AssetRecord[];
+        totalAssetCount?: number;
         syncHistory: SyncHistoryRecord[];
       };
       if (!res.ok) throw new Error(data.error || 'Failed to clear local cache');
       setPipelineSummary(data.summary);
       setClusters(data.clusters);
       setAssets(data.assets);
+      setTotalAssetCount(data.totalAssetCount ?? 0);
       setSyncHistory(data.syncHistory);
       notify(`Cleared ${data.cleared} cached assets and thumbnails from local storage.`);
     } catch (err) {
@@ -599,11 +614,13 @@ export default function App() {
         summary: PipelineRunSummary;
         clusters: ClusterRecord[];
         assets: AssetRecord[];
+        totalAssetCount?: number;
       };
       if (!res.ok) throw new Error(data.error || 'Upload failed');
       setPipelineSummary(data.summary);
       setClusters(data.clusters);
       setAssets(data.assets);
+      if (typeof data.totalAssetCount === 'number') setTotalAssetCount(data.totalAssetCount);
       notify(`Ingested ${data.inserted} local photos and extracted real CIELAB palettes.`);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Upload failed', 'err');
@@ -735,7 +752,16 @@ export default function App() {
       metric: pipelineSummary?.stage3.sceneSplitsDetected,
     },
     { id: 'sync', label: 'Sync Ledger', icon: History, metric: syncedCount },
-    { id: 'library', label: 'Library & Ingest', icon: Database, metric: assets.length },
+    {
+      id: 'library',
+      label: 'Library & Ingest',
+      icon: Database,
+      metric: Math.max(
+        totalAssetCount,
+        pipelineSummary?.stage1.totalAssets ?? 0,
+        pullProgress?.active ? (pullProgress.dbAssetCount ?? 0) : 0
+      ),
+    },
     { id: 'rules', label: 'Rules & Config', icon: Sliders },
   ];
 
@@ -983,14 +1009,31 @@ export default function App() {
           {pipelineSummary && (
             <div className="grid grid-cols-2 divide-y divide-zinc-200/80 dark:divide-white/[0.07] rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] sm:grid-cols-4 sm:divide-y-0 sm:divide-x">
               <div className="px-5 py-4">
-                <div className="text-xs text-zinc-500 dark:text-zinc-400">Eligible Assets</div>
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {pullProgress?.active && (pullProgress.dbAssetCount ?? 0) > pipelineSummary.stage1.totalAssets
+                    ? 'Indexing Assets (Live)'
+                    : 'Eligible Assets'}
+                </div>
                 <div className="mt-1.5 flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
-                    {pipelineSummary.stage1.eligibleAssets}
-                  </span>
-                  <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
-                    of {pipelineSummary.stage1.totalAssets}
-                  </span>
+                  {pullProgress?.active && (pullProgress.dbAssetCount ?? 0) > pipelineSummary.stage1.totalAssets ? (
+                    <>
+                      <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-indigo-600 dark:text-indigo-400">
+                        {(pullProgress.dbAssetCount ?? 0).toLocaleString()}
+                      </span>
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
+                        saved to SQLite
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
+                        {pipelineSummary.stage1.eligibleAssets.toLocaleString()}
+                      </span>
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
+                        of {pipelineSummary.stage1.totalAssets.toLocaleString()}
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -1121,6 +1164,7 @@ export default function App() {
               {section === 'library' && (
                 <LibraryIngestView
                   assets={assets}
+                  totalAssetCount={totalAssetCount}
                   immichStatus={immichStatus}
                   settings={settings}
                   pullProgress={pullProgress}

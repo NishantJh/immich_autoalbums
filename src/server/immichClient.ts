@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import type { ImmichStatus, PullPhase, PullProgressState } from '../shared/types.ts';
 import { decodeImageBufferToRgba, extractColorFeaturesFromPixels } from './colorLab.ts';
-import { DATA_DIR, getDb, getSettings, purgeDemoAssets, THUMBNAIL_DIR } from './db.ts';
+import { DATA_DIR, getAssetCount, getDb, getSettings, purgeDemoAssets, THUMBNAIL_DIR } from './db.ts';
 
 let pullProgress: PullProgressState = {
   active: false,
@@ -15,6 +15,8 @@ let pullProgress: PullProgressState = {
   total: 0,
   cachedCount: 0,
   ingestedCount: 0,
+  dbAssetCount: 0,
+  etaSeconds: null,
   cancelRequested: false,
   startedAt: null,
   updatedAt: new Date().toISOString(),
@@ -70,6 +72,8 @@ export function startPullProgress(label = 'Connecting to Immich'): void {
     total: 0,
     cachedCount: 0,
     ingestedCount: 0,
+    dbAssetCount: getAssetCount(),
+    etaSeconds: null,
     cancelRequested: false,
     startedAt: now,
     updatedAt: now,
@@ -85,6 +89,8 @@ export function finishPullProgress(detail: string, ingestedCount?: number): void
     percent: 100,
     label: 'Pull & scan complete',
     detail,
+    dbAssetCount: getAssetCount(),
+    etaSeconds: null,
     ...(typeof ingestedCount === 'number' ? { ingestedCount } : {}),
     error: null,
   });
@@ -437,7 +443,11 @@ export async function clearSavedImmichConnection(): Promise<ImmichStatus> {
   return checkImmichStatus();
 }
 
-async function immichFetch(apiPath: string, init: RequestInit = {}): Promise<Response> {
+async function immichFetch(
+  apiPath: string,
+  init: RequestInit = {},
+  timeoutMs = 15000
+): Promise<Response> {
   const cfg = getConfiguredImmich();
   if (!cfg) {
     throw new Error('Immich server is not configured.');
@@ -464,7 +474,7 @@ async function immichFetch(apiPath: string, init: RequestInit = {}): Promise<Res
   return fetch(targetUrl, {
     ...init,
     headers,
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 }
 
@@ -599,23 +609,47 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
       typeof options.maxAssets === 'number' && Number.isFinite(options.maxAssets)
         ? Math.max(0, Math.round(options.maxAssets))
         : settings.maxAssetsPerPull;
-    const effectiveMax = rawMax === 0 ? 100_000 : Math.min(100_000, rawMax);
-    const pageSize = 250;
+    const effectiveMax = rawMax === 0 ? 150_000 : Math.min(150_000, rawMax);
+    let pageSize = 1000;
     const excludedKeywords = settings.excludedPaths.map((p) => p.toLowerCase()).filter(Boolean);
+    const screenAspectRatios = [
+      16 / 9,
+      9 / 16,
+      19.5 / 9,
+      9 / 19.5,
+      20 / 9,
+      9 / 20,
+      21 / 9,
+      9 / 21,
+    ];
+    const looksLikeScreenshotItem = (item: ImmichSearchItem): boolean => {
+      if (!settings.ignoreScreenshots) return false;
+      const exif = item.exifInfo || {};
+      const missingCamera = !exif.make && !exif.model;
+      if (!missingCamera) return false;
+      const fname = item.originalFileName || '';
+      if (/screenshot|screen_shot|screen\s*capture/i.test(fname)) return true;
+      const w = exif.exifImageWidth || 0;
+      const h = exif.exifImageHeight || 0;
+      if (w <= 0 || h <= 0) return false;
+      const ratio = w / h;
+      return screenAspectRatios.some((r) => Math.abs(ratio - r) < 0.035);
+    };
 
-    // 1. Collect already-albumed asset IDs across all existing Immich albums (5% -> 16%)
+    // 1. Collect already-albumed asset IDs across all existing Immich albums (5% -> 14%)
     setPullProgress({
       active: true,
       phase: 'albums',
-      percent: 6,
+      percent: 5,
       label: 'Checking existing albums',
       detail: 'Listing Immich albums to preserve your curated collections...',
       current: 0,
       total: 0,
+      etaSeconds: null,
     });
 
     const alreadyAlbumedIds = new Set<string>();
-    const albumsRes = await immichFetch('/api/albums');
+    const albumsRes = await immichFetch('/api/albums', {}, 15000);
     if (albumsRes.ok) {
       const albums = (await albumsRes.json()) as Array<{ id: string }>;
       const totalAlbums = albums.length;
@@ -625,7 +659,7 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
         setPullProgress({
           active: true,
           phase: 'albums',
-          percent: 7,
+          percent: 6,
           label: 'Checking existing albums',
           detail: `0 / ${totalAlbums} albums inspected`,
           current: 0,
@@ -639,7 +673,11 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
         await Promise.all(
           batch.map(async (album) => {
             try {
-              const detailRes = await immichFetch(`/api/albums/${encodeURIComponent(album.id)}`);
+              const detailRes = await immichFetch(
+                `/api/albums/${encodeURIComponent(album.id)}`,
+                {},
+                15000
+              );
               if (detailRes.ok) {
                 const detail = (await detailRes.json()) as { assets?: Array<{ id: string }> };
                 for (const a of detail.assets || []) {
@@ -650,7 +688,7 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
               // Non-fatal
             } finally {
               checkedAlbums++;
-              const pct = 7 + (checkedAlbums / Math.max(1, totalAlbums)) * 9;
+              const pct = 6 + (checkedAlbums / Math.max(1, totalAlbums)) * 8;
               setPullProgress({
                 active: true,
                 phase: 'albums',
@@ -666,173 +704,35 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
       }
     }
 
-    // 2. Paginate POST /api/search/metadata excluding archived & trashed (16% -> 34%)
-    const collected: ImmichSearchItem[] = [];
-    const seenIds = new Set<string>();
-    let estimatedTotal = rawMax > 0 ? rawMax : 0;
-
-    setPullProgress({
-      active: true,
-      phase: 'metadata',
-      percent: 16,
-      label: 'Fetching photo metadata',
-      detail: rawMax === 0 ? 'Scanning full Immich library (page 1)...' : `Fetching up to ${rawMax.toLocaleString()} photos (page 1)...`,
-      current: 0,
-      total: estimatedTotal,
-    });
-
-    const maxPages = Math.ceil(effectiveMax / pageSize) + 1;
-    let nextPageNum = 1;
-    for (let step = 0; step < maxPages; step++) {
-      if (cancelRequestedFlag || collected.length >= effectiveMax) break;
-
-      const body: Record<string, unknown> = {
-        isArchived: false,
-        isTrashed: false,
-        type: 'IMAGE',
-        withExif: true,
-        withPeople: true,
-        page: nextPageNum,
-        size: pageSize,
-      };
-      if (options.takenAfter) body.takenAfter = options.takenAfter;
-      if (options.takenBefore) body.takenBefore = options.takenBefore;
-
-      const res = await immichFetch('/api/search/metadata', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        if (nextPageNum === 1) {
-          const errText = await res.text().catch(() => '');
-          throw new Error(
-            `Immich /api/search/metadata failed (HTTP ${res.status})${errText ? `: ${errText.slice(0, 140)}` : ''}`
-          );
-        }
-        break;
-      }
-
-      const payload = (await res.json()) as {
-        assets?: {
-          total?: number;
-          count?: number;
-          items?: ImmichSearchItem[];
-          nextPage?: string | number | null;
-        };
-      };
-
-      const items = payload.assets?.items || [];
-      if (typeof payload.assets?.total === 'number' && payload.assets.total > 0) {
-        estimatedTotal = rawMax > 0 ? Math.min(rawMax, payload.assets.total) : payload.assets.total;
-      }
-
-      for (const item of items) {
-        if (collected.length >= effectiveMax) break;
-        if (!seenIds.has(item.id)) {
-          seenIds.add(item.id);
-          collected.push(item);
-        }
-      }
-
-      const metaFraction =
-        estimatedTotal > 0
-          ? Math.min(1, collected.length / estimatedTotal)
-          : Math.min(0.95, 1 - Math.exp(-collected.length / 1500));
-      const pct = 16 + metaFraction * 18;
-      setPullProgress({
-        active: true,
-        phase: 'metadata',
-        percent: pct,
-        label: 'Fetching photo metadata',
-        detail:
-          estimatedTotal > 0
-            ? `Page ${nextPageNum} · ${collected.length.toLocaleString()} / ${estimatedTotal.toLocaleString()} photos listed`
-            : `Page ${nextPageNum} · ${collected.length.toLocaleString()} photos listed`,
-        current: collected.length,
-        total: estimatedTotal || collected.length,
-      });
-
-      if (!payload.assets?.nextPage || items.length === 0) break;
-      const parsedNext = Number(payload.assets.nextPage);
-      nextPageNum = Number.isFinite(parsedNext) && parsedNext > nextPageNum ? parsedNext : nextPageNum + 1;
-    }
-
-    // 3. Query CLIP Smart Search occasion prompts (34% -> 42%)
-    const tagMap = new Map<string, Set<string>>();
-    let smartTagsMatched = 0;
-    let promptsDone = 0;
-
-    if (!cancelRequestedFlag && collected.length > 0) {
-      setPullProgress({
-        active: true,
-        phase: 'smart_search',
-        percent: 34,
-        label: 'Querying Immich Smart Search',
-        detail: `0 / ${OCCASION_PROMPTS.length} scene prompts completed`,
-        current: 0,
-        total: OCCASION_PROMPTS.length,
-      });
-
-      const SMART_CONCURRENCY = 6;
-      for (let i = 0; i < OCCASION_PROMPTS.length; i += SMART_CONCURRENCY) {
-        if (cancelRequestedFlag) break;
-        const promptBatch = OCCASION_PROMPTS.slice(i, i + SMART_CONCURRENCY);
-        await Promise.all(
-          promptBatch.map(async (prompt) => {
-            try {
-              const smartRes = await immichFetch('/api/search/smart', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  query: prompt,
-                  type: 'IMAGE',
-                  size: 400,
-                }),
-              });
-              if (!smartRes.ok) return;
-              const payload = (await smartRes.json()) as { assets?: { items?: Array<{ id: string }> } };
-              for (const item of payload.assets?.items || []) {
-                if (!tagMap.has(item.id)) tagMap.set(item.id, new Set());
-                tagMap.get(item.id)!.add(prompt);
-                smartTagsMatched++;
-              }
-            } catch {
-              // Non-fatal if ML container is temporarily busy
-            } finally {
-              promptsDone++;
-              const pct = 34 + (promptsDone / OCCASION_PROMPTS.length) * 8;
-              setPullProgress({
-                active: true,
-                phase: 'smart_search',
-                percent: pct,
-                label: 'Querying Immich ML Smart Search',
-                detail: `${promptsDone} / ${OCCASION_PROMPTS.length} CLIP visual concepts · ${smartTagsMatched.toLocaleString()} matches`,
-                current: promptsDone,
-                total: OCCASION_PROMPTS.length,
-              });
-            }
-          })
+    // 1b. Query true total image count via GET /api/assets/statistics (never rely on per-page total=250)
+    let libraryImageTotal = 0;
+    if (!options.takenAfter && !options.takenBefore) {
+      try {
+        const statsRes = await immichFetch(
+          '/api/assets/statistics?isArchived=false&isTrashed=false',
+          {},
+          10000
         );
+        if (statsRes.ok) {
+          const stats = (await statsRes.json()) as { images?: number; total?: number };
+          if (typeof stats.images === 'number' && stats.images > 0) {
+            libraryImageTotal = stats.images;
+          } else if (typeof stats.total === 'number' && stats.total > 0) {
+            libraryImageTotal = stats.total;
+          }
+        }
+      } catch {
+        // Non-fatal: older servers or proxies without /statistics will use dynamic progress
       }
     }
 
-    // 4. Download thumbnails + extract CIELAB features incrementally per batch & save to SQLite (42% -> 92%)
+    // Prepare SQLite statements up front so EVERY metadata page is persisted immediately
     fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
     const db = getDb();
     const now = new Date().toISOString();
+    let demoPurged = false;
 
-    if (collected.length > 0) {
-      purgeDemoAssets();
-    }
-
-    // Preload existing cached assets so incremental re-scans skip already-downloaded & analyzed photos
-    const existingRows = db
-      .prepare('SELECT id, thumbnail_file, lab_l FROM assets')
-      .all() as Array<{ id: string; thumbnail_file: string | null; lab_l: number | null }>;
-    const existingById = new Map(existingRows.map((r) => [r.id, r]));
-
-    const upsert = db.prepare(`
+    const upsertMetadata = db.prepare(`
       INSERT INTO assets (
         id, source, file_name, original_path, local_date_time,
         city, state, country, latitude, longitude,
@@ -845,8 +745,8 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
         @city, @state, @country, @latitude, @longitude,
         @exif_make, @exif_model, @lens_model, @focal_length, @iso, @is_favorite,
         @width, @height, @is_archived, @is_trashed, @is_already_albumed,
-        0, NULL, @people_ids_json, @people_names_json, @smart_tags_json,
-        @thumbnail_file, @lab_l, @lab_a, @lab_b, @lab_chroma, @lab_hist_json, @palette_json, @created_at
+        0, NULL, @people_ids_json, @people_names_json, '[]',
+        NULL, NULL, NULL, NULL, NULL, NULL, '[]', @created_at
       )
       ON CONFLICT(id) DO UPDATE SET
         city = excluded.city,
@@ -864,250 +764,534 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
         is_trashed = excluded.is_trashed,
         is_already_albumed = excluded.is_already_albumed,
         people_ids_json = excluded.people_ids_json,
-        people_names_json = excluded.people_names_json,
-        smart_tags_json = excluded.smart_tags_json,
-        thumbnail_file = COALESCE(excluded.thumbnail_file, assets.thumbnail_file),
-        lab_l = COALESCE(excluded.lab_l, assets.lab_l),
-        lab_a = COALESCE(excluded.lab_a, assets.lab_a),
-        lab_b = COALESCE(excluded.lab_b, assets.lab_b),
-        lab_chroma = COALESCE(excluded.lab_chroma, assets.lab_chroma),
-        lab_hist_json = COALESCE(excluded.lab_hist_json, assets.lab_hist_json),
-        palette_json = COALESCE(excluded.palette_json, assets.palette_json)
+        people_names_json = excluded.people_names_json
     `);
+
+    const updateSmartTagsStmt = db.prepare('UPDATE assets SET smart_tags_json = ? WHERE id = ?');
+    const updateThumbLabStmt = db.prepare(`
+      UPDATE assets
+      SET thumbnail_file = COALESCE(@thumbnail_file, thumbnail_file),
+          lab_l = COALESCE(@lab_l, lab_l),
+          lab_a = COALESCE(@lab_a, lab_a),
+          lab_b = COALESCE(@lab_b, lab_b),
+          lab_chroma = COALESCE(@lab_chroma, lab_chroma),
+          lab_hist_json = COALESCE(@lab_hist_json, lab_hist_json),
+          palette_json = COALESCE(@palette_json, palette_json)
+      WHERE id = @id
+    `);
+
+    const persistMetadataItems = db.transaction((itemsToSave: ImmichSearchItem[]) => {
+      for (const item of itemsToSave) {
+        const exif = item.exifInfo || {};
+        const rawLat = typeof exif.latitude === 'number' ? exif.latitude : null;
+        const rawLng = typeof exif.longitude === 'number' ? exif.longitude : null;
+        const hasValidCoords =
+          rawLat !== null &&
+          rawLng !== null &&
+          Number.isFinite(rawLat) &&
+          Number.isFinite(rawLng) &&
+          rawLat >= -90 &&
+          rawLat <= 90 &&
+          rawLng >= -180 &&
+          rawLng <= 180 &&
+          !(Math.abs(rawLat) < 0.001 && Math.abs(rawLng) < 0.001);
+
+        const rawCity = typeof exif.city === 'string' ? exif.city.trim() : '';
+        const rawState = typeof exif.state === 'string' ? exif.state.trim() : '';
+        const rawCountry = typeof exif.country === 'string' ? exif.country.trim() : '';
+        const isCyrillicCountry =
+          /russia|belarus|ukraine|kazakhstan|kyrgyzstan|bulgaria|serbia|macedonia|mongolia|tajikistan|uzbekistan|montenegro|bosnia/i.test(
+            rawCountry
+          );
+        const hasCyrillic = (s: string) => /[\u0400-\u04FF]/.test(s);
+        let resolvedCity: string | null = rawCity || null;
+        if (resolvedCity && !isCyrillicCountry && hasCyrillic(resolvedCity)) {
+          resolvedCity = null;
+        }
+        if (resolvedCity && rawCountry && resolvedCity.toLowerCase() === rawCountry.toLowerCase()) {
+          resolvedCity = null;
+        }
+        const resolvedState =
+          rawState &&
+          !(!isCyrillicCountry && hasCyrillic(rawState)) &&
+          (!rawCountry || rawState.toLowerCase() !== rawCountry.toLowerCase())
+            ? rawState
+            : null;
+
+        const peopleList = item.people || [];
+        const peopleIds = peopleList.map((p) => p.id).filter(Boolean);
+        const peopleNames = peopleList
+          .map((p) => (typeof p.name === 'string' ? p.name.trim() : ''))
+          .filter(Boolean);
+
+        const origPath = item.originalPath || `/immich/${item.originalFileName || item.id}`;
+        upsertMetadata.run({
+          id: item.id,
+          file_name: item.originalFileName || `${item.id}.jpg`,
+          original_path: origPath,
+          local_date_time: item.localDateTime || item.fileCreatedAt || now,
+          city: resolvedCity,
+          state: resolvedState,
+          country: rawCountry || null,
+          latitude: hasValidCoords ? rawLat : null,
+          longitude: hasValidCoords ? rawLng : null,
+          exif_make: exif.make || null,
+          exif_model: exif.model || null,
+          lens_model:
+            typeof exif.lensModel === 'string' && exif.lensModel.trim()
+              ? exif.lensModel.trim()
+              : null,
+          focal_length:
+            typeof exif.focalLength === 'number' && Number.isFinite(exif.focalLength)
+              ? exif.focalLength
+              : null,
+          iso: typeof exif.iso === 'number' && Number.isFinite(exif.iso) ? Math.round(exif.iso) : null,
+          is_favorite: item.isFavorite ? 1 : 0,
+          width: exif.exifImageWidth || 1600,
+          height: exif.exifImageHeight || 1200,
+          is_archived: item.isArchived ? 1 : 0,
+          is_trashed: item.isTrashed ? 1 : 0,
+          is_already_albumed: alreadyAlbumedIds.has(item.id) ? 1 : 0,
+          people_ids_json: JSON.stringify(peopleIds),
+          people_names_json: JSON.stringify(peopleNames),
+          created_at: now,
+        });
+      }
+    });
+
+    // 2. Paginate POST /api/search/metadata excluding archived & trashed (14% -> 36%)
+    //    Saves EVERY page immediately to SQLite so stopping early still clusters all pulled photos!
+    const collected: ImmichSearchItem[] = [];
+    const seenIds = new Set<string>();
+    let estimatedTotal =
+      rawMax > 0
+        ? libraryImageTotal > 0
+          ? Math.min(rawMax, libraryImageTotal)
+          : rawMax
+        : libraryImageTotal;
+    const metaStartedAt = Date.now();
+
+    setPullProgress({
+      active: true,
+      phase: 'metadata',
+      percent: 14,
+      label: 'Fetching photo metadata',
+      detail:
+        estimatedTotal > 0
+          ? `Page 1 · 0 / ${estimatedTotal.toLocaleString()} photos indexed`
+          : rawMax === 0
+            ? 'Scanning full Immich library (page 1)...'
+            : `Fetching up to ${rawMax.toLocaleString()} photos (page 1)...`,
+      current: 0,
+      total: estimatedTotal,
+      dbAssetCount: getAssetCount(),
+      etaSeconds: null,
+    });
+
+    const maxPages = Math.ceil(effectiveMax / 250) + 5;
+    let nextPageNum = 1;
+    let savedToDbCount = 0;
+
+    for (let step = 0; step < maxPages; step++) {
+      if (cancelRequestedFlag || collected.length >= effectiveMax) break;
+
+      const buildBody = () => {
+        const body: Record<string, unknown> = {
+          isArchived: false,
+          isTrashed: false,
+          type: 'IMAGE',
+          withExif: true,
+          withPeople: true,
+          page: nextPageNum,
+          size: pageSize,
+        };
+        if (options.takenAfter) body.takenAfter = options.takenAfter;
+        if (options.takenBefore) body.takenBefore = options.takenBefore;
+        return body;
+      };
+
+      let res: Response | null = null;
+      let lastErrText = '';
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          res = await immichFetch(
+            '/api/search/metadata',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(buildBody()),
+            },
+            30000
+          );
+          if (res.ok) break;
+          lastErrText = await res.text().catch(() => '');
+          // Fallback to pageSize=250 if an Immich server rejects size=1000 on page 1
+          if (res.status === 400 && pageSize > 250 && nextPageNum === 1 && attempt === 0) {
+            pageSize = 250;
+            continue;
+          }
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        } catch (err) {
+          lastErrText = err instanceof Error ? err.message : 'Request timed out';
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+      }
+
+      if (!res || !res.ok) {
+        if (nextPageNum === 1) {
+          throw new Error(
+            `Immich /api/search/metadata failed${res ? ` (HTTP ${res.status})` : ''}${lastErrText ? `: ${lastErrText.slice(0, 140)}` : ''}`
+          );
+        }
+        break;
+      }
+
+      const payload = (await res.json()) as {
+        assets?: {
+          total?: number;
+          count?: number;
+          items?: ImmichSearchItem[];
+          nextPage?: string | number | null;
+        };
+      };
+
+      const items = payload.assets?.items || [];
+      const pageNewItems: ImmichSearchItem[] = [];
+      for (const item of items) {
+        if (collected.length >= effectiveMax) break;
+        if (!seenIds.has(item.id)) {
+          seenIds.add(item.id);
+          collected.push(item);
+          pageNewItems.push(item);
+        }
+      }
+
+      // Guard against Immich nextPage loop bug (e.g. repeated identical page)
+      if (pageNewItems.length === 0) {
+        break;
+      }
+
+      if (!demoPurged) {
+        purgeDemoAssets();
+        demoPurged = true;
+      }
+      persistMetadataItems(pageNewItems);
+      savedToDbCount = collected.length;
+      const currentDbTotal = getAssetCount();
+
+      // Never treat Immich's per-page count (e.g. 250 or 1000) as total library size!
+      const reportedTotal = typeof payload.assets?.total === 'number' ? payload.assets.total : 0;
+      if (estimatedTotal === 0 && reportedTotal > pageSize) {
+        estimatedTotal = rawMax > 0 ? Math.min(rawMax, reportedTotal) : reportedTotal;
+      }
+      if (estimatedTotal > 0 && collected.length > estimatedTotal) {
+        estimatedTotal = 0;
+      }
+
+      const metaFraction =
+        estimatedTotal > 0
+          ? Math.min(1, collected.length / estimatedTotal)
+          : Math.min(0.95, collected.length / (collected.length + 5000));
+      const pct = 14 + metaFraction * 22;
+      const elapsedSec = Math.max(0.5, (Date.now() - metaStartedAt) / 1000);
+      const rate = collected.length / elapsedSec;
+      const etaSec =
+        estimatedTotal > collected.length && rate > 0
+          ? Math.round((estimatedTotal - collected.length) / rate)
+          : null;
+
+      setPullProgress({
+        active: true,
+        phase: 'metadata',
+        percent: pct,
+        label: 'Fetching & saving photo metadata',
+        detail:
+          estimatedTotal > 0
+            ? `Page ${nextPageNum} · ${collected.length.toLocaleString()} / ${estimatedTotal.toLocaleString()} photos saved to SQLite`
+            : `Page ${nextPageNum} · ${collected.length.toLocaleString()} photos saved to SQLite`,
+        current: collected.length,
+        total: estimatedTotal || collected.length,
+        ingestedCount: savedToDbCount,
+        dbAssetCount: currentDbTotal,
+        etaSeconds: etaSec,
+      });
+
+      if (!payload.assets?.nextPage || items.length === 0) break;
+      const parsedNext = Number(payload.assets.nextPage);
+      nextPageNum =
+        Number.isFinite(parsedNext) && parsedNext > nextPageNum ? parsedNext : nextPageNum + 1;
+    }
+
+    // 3. Query CLIP Smart Search occasion prompts (36% -> 44%) and persist tags immediately
+    const tagMap = new Map<string, Set<string>>();
+    let smartTagsMatched = 0;
+    let promptsDone = 0;
+
+    if (!cancelRequestedFlag && collected.length > 0) {
+      setPullProgress({
+        active: true,
+        phase: 'smart_search',
+        percent: 36,
+        label: 'Querying Immich ML Smart Search',
+        detail: `0 / ${OCCASION_PROMPTS.length} CLIP visual concepts`,
+        current: 0,
+        total: OCCASION_PROMPTS.length,
+        etaSeconds: null,
+      });
+
+      const SMART_CONCURRENCY = 6;
+      for (let i = 0; i < OCCASION_PROMPTS.length; i += SMART_CONCURRENCY) {
+        if (cancelRequestedFlag) break;
+        const promptBatch = OCCASION_PROMPTS.slice(i, i + SMART_CONCURRENCY);
+        await Promise.all(
+          promptBatch.map(async (prompt) => {
+            try {
+              const smartRes = await immichFetch(
+                '/api/search/smart',
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    query: prompt,
+                    type: 'IMAGE',
+                    size: 500,
+                  }),
+                },
+                25000
+              );
+              if (!smartRes.ok) return;
+              const payload = (await smartRes.json()) as {
+                assets?: { items?: Array<{ id: string }> };
+              };
+              for (const item of payload.assets?.items || []) {
+                if (!seenIds.has(item.id)) continue;
+                if (!tagMap.has(item.id)) tagMap.set(item.id, new Set());
+                tagMap.get(item.id)!.add(prompt);
+                smartTagsMatched++;
+              }
+            } catch {
+              // Non-fatal if ML container is temporarily busy
+            } finally {
+              promptsDone++;
+              const pct = 36 + (promptsDone / OCCASION_PROMPTS.length) * 8;
+              setPullProgress({
+                active: true,
+                phase: 'smart_search',
+                percent: pct,
+                label: 'Querying Immich ML Smart Search',
+                detail: `${promptsDone} / ${OCCASION_PROMPTS.length} CLIP visual concepts · ${smartTagsMatched.toLocaleString()} matches`,
+                current: promptsDone,
+                total: OCCASION_PROMPTS.length,
+              });
+            }
+          })
+        );
+      }
+
+      if (tagMap.size > 0) {
+        db.transaction(() => {
+          for (const [assetId, tags] of tagMap.entries()) {
+            updateSmartTagsStmt.run(JSON.stringify(Array.from(tags)), assetId);
+          }
+        })();
+      }
+    }
+
+    // 4. Download thumbnails + extract CIELAB color features for uncached eligible photos (44% -> 92%)
+    const existingRows = db
+      .prepare('SELECT id, thumbnail_file, lab_l FROM assets')
+      .all() as Array<{ id: string; thumbnail_file: string | null; lab_l: number | null }>;
+    const existingById = new Map(existingRows.map((r) => [r.id, r]));
 
     const totalAssets = collected.length;
     let processedCount = 0;
     let cachedCount = 0;
     let skippedExcludedCount = 0;
-    let savedToDbCount = 0;
+    const thumbStartedAt = Date.now();
 
-    setPullProgress({
-      active: true,
-      phase: 'thumbnails',
-      percent: 42,
-      label: 'Downloading thumbnails & analyzing color',
-      detail:
-        totalAssets > 0
-          ? `0 / ${totalAssets.toLocaleString()} photos processed`
-          : 'No new photos found',
-      current: 0,
-      total: totalAssets,
-      cachedCount: 0,
-      ingestedCount: 0,
-    });
-
-    const CONCURRENCY = 10;
-    for (let i = 0; i < collected.length; i += CONCURRENCY) {
-      if (cancelRequestedFlag) break;
-      const batch = collected.slice(i, i + CONCURRENCY);
-
-      const batchResults = await Promise.all(
-        batch.map(async (item) => {
-          const isAlbumed = alreadyAlbumedIds.has(item.id);
-          const origPath = item.originalPath || `/immich/${item.originalFileName || item.id}`;
-          const lowerPath = origPath.toLowerCase();
-          const isPathExcluded = excludedKeywords.some((kw) => lowerPath.includes(kw));
-
-          const existing = existingById.get(item.id);
-          const safeId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-
-          let thumbFile: string | null = existing?.thumbnail_file || null;
-          if (thumbFile && !fs.existsSync(path.join(THUMBNAIL_DIR, thumbFile))) {
-            thumbFile = null;
-          }
-          if (!thumbFile) {
-            for (const ext of ['jpg', 'png', 'webp'] as const) {
-              const candidate = `immich_${safeId}.${ext}`;
-              if (fs.existsSync(path.join(THUMBNAIL_DIR, candidate))) {
-                thumbFile = candidate;
-                break;
-              }
-            }
-          }
-
-          let features: ReturnType<typeof extractColorFeaturesFromPixels> | null = null;
-          const alreadyHasLab = existing?.lab_l !== null && existing?.lab_l !== undefined;
-
-          if (isAlbumed || isPathExcluded) {
-            // Skip downloading thumbnails for assets Stage 1 will exclude anyway
-            skippedExcludedCount++;
-          } else if (thumbFile && alreadyHasLab) {
-            cachedCount++;
-          } else {
-            let imgBuf: Buffer | null = null;
-
-            if (thumbFile) {
-              cachedCount++;
-              try {
-                imgBuf = fs.readFileSync(path.join(THUMBNAIL_DIR, thumbFile));
-              } catch {
-                imgBuf = null;
-              }
-            } else {
-              try {
-                const thumbRes = await immichFetch(
-                  `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
-                  { headers: { Accept: 'image/jpeg,image/png,image/webp,*/*' } }
-                );
-                if (thumbRes.ok) {
-                  let buf = Buffer.from(await thumbRes.arrayBuffer());
-                  if (isWebpBuffer(buf)) {
-                    try {
-                      const previewRes = await immichFetch(
-                        `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=preview`,
-                        { headers: { Accept: 'image/jpeg,image/png,*/*' } }
-                      );
-                      if (previewRes.ok) {
-                        const previewBuf = Buffer.from(await previewRes.arrayBuffer());
-                        if (!isWebpBuffer(previewBuf) && previewBuf.length > 0) {
-                          buf = previewBuf;
-                        }
-                      }
-                    } catch {
-                      // Keep WebP
-                    }
-                  }
-                  if (buf.length > 0) {
-                    const ext = detectThumbExt(buf);
-                    thumbFile = `immich_${safeId}.${ext}`;
-                    fs.writeFileSync(path.join(THUMBNAIL_DIR, thumbFile), buf);
-                    imgBuf = buf;
-                  }
-                }
-              } catch {
-                // Non-fatal thumbnail error
-              }
-            }
-
-            if (imgBuf && !alreadyHasLab && thumbFile && !thumbFile.endsWith('.webp')) {
-              try {
-                const mime = thumbFile.endsWith('.png') ? 'image/png' : 'image/jpeg';
-                const decoded = decodeImageBufferToRgba(imgBuf, mime);
-                features = extractColorFeaturesFromPixels(
-                  decoded.data,
-                  decoded.width,
-                  decoded.height
-                );
-              } catch {
-                // Non-fatal decode error; pipeline has neutral fallback
-              }
-            }
-          }
-
-          return { item, origPath, isAlbumed, thumbFile, features };
-        })
-      );
-
-      // Persist this batch to SQLite immediately so progress survives cancellation
-      db.transaction(() => {
-        for (const row of batchResults) {
-          const exif = row.item.exifInfo || {};
-          const rawLat = typeof exif.latitude === 'number' ? exif.latitude : null;
-          const rawLng = typeof exif.longitude === 'number' ? exif.longitude : null;
-          const hasValidCoords =
-            rawLat !== null &&
-            rawLng !== null &&
-            Number.isFinite(rawLat) &&
-            Number.isFinite(rawLng) &&
-            rawLat >= -90 &&
-            rawLat <= 90 &&
-            rawLng >= -180 &&
-            rawLng <= 180 &&
-            !(Math.abs(rawLat) < 0.001 && Math.abs(rawLng) < 0.001);
-
-          const rawCity = typeof exif.city === 'string' ? exif.city.trim() : '';
-          const rawState = typeof exif.state === 'string' ? exif.state.trim() : '';
-          const rawCountry = typeof exif.country === 'string' ? exif.country.trim() : '';
-          const isCyrillicCountry =
-            /russia|belarus|ukraine|kazakhstan|kyrgyzstan|bulgaria|serbia|macedonia|mongolia|tajikistan|uzbekistan|montenegro|bosnia/i.test(
-              rawCountry
-            );
-          const hasCyrillic = (s: string) => /[\u0400-\u04FF]/.test(s);
-          let resolvedCity: string | null = rawCity || null;
-          if (resolvedCity && !isCyrillicCountry && hasCyrillic(resolvedCity)) {
-            resolvedCity = null;
-          }
-          if (resolvedCity && rawCountry && resolvedCity.toLowerCase() === rawCountry.toLowerCase()) {
-            resolvedCity = null;
-          }
-          const resolvedState =
-            rawState &&
-            !(!isCyrillicCountry && hasCyrillic(rawState)) &&
-            (!rawCountry || rawState.toLowerCase() !== rawCountry.toLowerCase())
-              ? rawState
-              : null;
-
-          const peopleList = row.item.people || [];
-          const peopleIds = peopleList.map((p) => p.id).filter(Boolean);
-          const peopleNames = peopleList
-            .map((p) => (typeof p.name === 'string' ? p.name.trim() : ''))
-            .filter(Boolean);
-
-          upsert.run({
-            id: row.item.id,
-            file_name: row.item.originalFileName || `${row.item.id}.jpg`,
-            original_path: row.origPath,
-            local_date_time: row.item.localDateTime || row.item.fileCreatedAt || now,
-            city: resolvedCity,
-            state: resolvedState,
-            country: rawCountry || null,
-            latitude: hasValidCoords ? rawLat : null,
-            longitude: hasValidCoords ? rawLng : null,
-            exif_make: exif.make || null,
-            exif_model: exif.model || null,
-            lens_model: typeof exif.lensModel === 'string' && exif.lensModel.trim() ? exif.lensModel.trim() : null,
-            focal_length: typeof exif.focalLength === 'number' && Number.isFinite(exif.focalLength) ? exif.focalLength : null,
-            iso: typeof exif.iso === 'number' && Number.isFinite(exif.iso) ? Math.round(exif.iso) : null,
-            is_favorite: row.item.isFavorite ? 1 : 0,
-            width: exif.exifImageWidth || 1600,
-            height: exif.exifImageHeight || 1200,
-            is_archived: row.item.isArchived ? 1 : 0,
-            is_trashed: row.item.isTrashed ? 1 : 0,
-            is_already_albumed: row.isAlbumed ? 1 : 0,
-            people_ids_json: JSON.stringify(peopleIds),
-            people_names_json: JSON.stringify(peopleNames),
-            smart_tags_json: JSON.stringify(Array.from(tagMap.get(row.item.id) || [])),
-            thumbnail_file: row.thumbFile,
-            lab_l: row.features ? row.features.avgLab.l : null,
-            lab_a: row.features ? row.features.avgLab.a : null,
-            lab_b: row.features ? row.features.avgLab.b : null,
-            lab_chroma: row.features ? row.features.avgLab.chroma : null,
-            lab_hist_json: row.features ? JSON.stringify(row.features.histogram) : null,
-            palette_json: row.features ? JSON.stringify(row.features.palette) : null,
-            created_at: now,
-          });
-          savedToDbCount++;
-        }
-      })();
-
-      processedCount += batchResults.length;
-      const pct = 42 + (processedCount / Math.max(1, totalAssets)) * 50;
-      const notes: string[] = [];
-      if (cachedCount > 0) notes.push(`${cachedCount.toLocaleString()} cached`);
-      if (skippedExcludedCount > 0) notes.push(`${skippedExcludedCount.toLocaleString()} skipped`);
+    if (!cancelRequestedFlag && totalAssets > 0) {
       setPullProgress({
         active: true,
         phase: 'thumbnails',
-        percent: pct,
-        label: 'Downloading thumbnails & analyzing color',
-        detail: `${processedCount.toLocaleString()} / ${totalAssets.toLocaleString()} photos${notes.length > 0 ? ` (${notes.join(' · ')})` : ''}`,
-        current: processedCount,
+        percent: 44,
+        label: 'Downloading thumbnails & extracting CIELAB color',
+        detail: `0 / ${totalAssets.toLocaleString()} photos processed`,
+        current: 0,
         total: totalAssets,
-        cachedCount,
+        cachedCount: 0,
         ingestedCount: savedToDbCount,
+        dbAssetCount: getAssetCount(),
+        etaSeconds: null,
       });
+
+      const CONCURRENCY = 20;
+      for (let i = 0; i < collected.length; i += CONCURRENCY) {
+        if (cancelRequestedFlag) break;
+        const batch = collected.slice(i, i + CONCURRENCY);
+
+        const batchResults = await Promise.all(
+          batch.map(async (item) => {
+            const isAlbumed = alreadyAlbumedIds.has(item.id);
+            const origPath = item.originalPath || `/immich/${item.originalFileName || item.id}`;
+            const lowerPath = origPath.toLowerCase();
+            const isPathExcluded = excludedKeywords.some((kw) => lowerPath.includes(kw));
+            const isShot = looksLikeScreenshotItem(item);
+
+            const existing = existingById.get(item.id);
+            const safeId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+            let thumbFile: string | null = existing?.thumbnail_file || null;
+            if (thumbFile && !fs.existsSync(path.join(THUMBNAIL_DIR, thumbFile))) {
+              thumbFile = null;
+            }
+            if (!thumbFile) {
+              for (const ext of ['jpg', 'png', 'webp'] as const) {
+                const candidate = `immich_${safeId}.${ext}`;
+                if (fs.existsSync(path.join(THUMBNAIL_DIR, candidate))) {
+                  thumbFile = candidate;
+                  break;
+                }
+              }
+            }
+
+            let features: ReturnType<typeof extractColorFeaturesFromPixels> | null = null;
+            const alreadyHasLab = existing?.lab_l !== null && existing?.lab_l !== undefined;
+            let needsDbUpdate = false;
+
+            if (isAlbumed || isPathExcluded || isShot) {
+              skippedExcludedCount++;
+            } else if (thumbFile && alreadyHasLab) {
+              cachedCount++;
+            } else {
+              let imgBuf: Buffer | null = null;
+
+              if (thumbFile) {
+                cachedCount++;
+                try {
+                  imgBuf = fs.readFileSync(path.join(THUMBNAIL_DIR, thumbFile));
+                } catch {
+                  imgBuf = null;
+                }
+              } else {
+                try {
+                  const thumbRes = await immichFetch(
+                    `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
+                    { headers: { Accept: 'image/jpeg,image/png,image/webp,*/*' } },
+                    15000
+                  );
+                  if (thumbRes.ok) {
+                    let buf = Buffer.from(await thumbRes.arrayBuffer());
+                    if (isWebpBuffer(buf)) {
+                      try {
+                        const previewRes = await immichFetch(
+                          `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=preview`,
+                          { headers: { Accept: 'image/jpeg,image/png,*/*' } },
+                          15000
+                        );
+                        if (previewRes.ok) {
+                          const previewBuf = Buffer.from(await previewRes.arrayBuffer());
+                          if (!isWebpBuffer(previewBuf) && previewBuf.length > 0) {
+                            buf = previewBuf;
+                          }
+                        }
+                      } catch {
+                        // Keep WebP
+                      }
+                    }
+                    if (buf.length > 0) {
+                      const ext = detectThumbExt(buf);
+                      thumbFile = `immich_${safeId}.${ext}`;
+                      fs.writeFileSync(path.join(THUMBNAIL_DIR, thumbFile), buf);
+                      imgBuf = buf;
+                      needsDbUpdate = true;
+                    }
+                  }
+                } catch {
+                  // Non-fatal thumbnail error
+                }
+              }
+
+              if (imgBuf && !alreadyHasLab && thumbFile && !thumbFile.endsWith('.webp')) {
+                try {
+                  const mime = thumbFile.endsWith('.png') ? 'image/png' : 'image/jpeg';
+                  const decoded = decodeImageBufferToRgba(imgBuf, mime);
+                  features = extractColorFeaturesFromPixels(
+                    decoded.data,
+                    decoded.width,
+                    decoded.height
+                  );
+                  needsDbUpdate = true;
+                } catch {
+                  // Non-fatal decode error; pipeline has neutral fallback
+                }
+              }
+            }
+
+            return { id: item.id, thumbFile, features, needsDbUpdate };
+          })
+        );
+
+        const toWrite = batchResults.filter((r) => r.needsDbUpdate);
+        if (toWrite.length > 0) {
+          db.transaction(() => {
+            for (const row of toWrite) {
+              updateThumbLabStmt.run({
+                id: row.id,
+                thumbnail_file: row.thumbFile,
+                lab_l: row.features ? row.features.avgLab.l : null,
+                lab_a: row.features ? row.features.avgLab.a : null,
+                lab_b: row.features ? row.features.avgLab.b : null,
+                lab_chroma: row.features ? row.features.avgLab.chroma : null,
+                lab_hist_json: row.features ? JSON.stringify(row.features.histogram) : null,
+                palette_json: row.features ? JSON.stringify(row.features.palette) : null,
+              });
+            }
+          })();
+        }
+
+        processedCount += batchResults.length;
+        const pct = 44 + (processedCount / Math.max(1, totalAssets)) * 48;
+        const thumbElapsed = Math.max(0.5, (Date.now() - thumbStartedAt) / 1000);
+        const rate = processedCount / thumbElapsed;
+        const etaSec =
+          totalAssets > processedCount && rate > 0
+            ? Math.round((totalAssets - processedCount) / rate)
+            : null;
+        const notes: string[] = [];
+        if (cachedCount > 0) notes.push(`${cachedCount.toLocaleString()} cached`);
+        if (skippedExcludedCount > 0) notes.push(`${skippedExcludedCount.toLocaleString()} skipped`);
+        setPullProgress({
+          active: true,
+          phase: 'thumbnails',
+          percent: pct,
+          label: 'Downloading thumbnails & extracting CIELAB color',
+          detail: `${processedCount.toLocaleString()} / ${totalAssets.toLocaleString()} photos${notes.length > 0 ? ` (${notes.join(' · ')})` : ''}`,
+          current: processedCount,
+          total: totalAssets,
+          cachedCount,
+          ingestedCount: savedToDbCount,
+          etaSeconds: etaSec,
+        });
+      }
     }
 
+    const totalInDb = getAssetCount();
     setPullProgress({
       active: true,
       phase: 'clustering',
       percent: 94,
       label: 'Building event & color-tone albums',
-      detail: `Clustering ${savedToDbCount.toLocaleString()} indexed photos into album proposals...`,
+      detail: `Clustering ${totalInDb.toLocaleString()} indexed photos into album proposals...`,
       current: savedToDbCount,
-      total: totalAssets,
+      total: Math.max(totalAssets, totalInDb),
       cachedCount,
       ingestedCount: savedToDbCount,
+      dbAssetCount: totalInDb,
+      etaSeconds: null,
     });
 
     return {

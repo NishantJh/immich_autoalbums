@@ -370,10 +370,22 @@ export function getAllAssetsWithHist(): Array<{
   }));
 }
 
+export function getAssetCount(): number {
+  const row = getDb().prepare('SELECT COUNT(*) as c FROM assets').get() as { c: number };
+  return row?.c || 0;
+}
+
 export function getAllAssets(): AssetRecord[] {
   const rows = getDb()
     .prepare('SELECT * FROM assets ORDER BY local_date_time ASC')
     .all() as DbAssetRow[];
+  return rows.map(rowToAsset);
+}
+
+export function getRecentAssets(limit = 600): AssetRecord[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM assets ORDER BY local_date_time DESC LIMIT ?')
+    .all(Math.max(1, Math.min(5000, Math.round(limit)))) as DbAssetRow[];
   return rows.map(rowToAsset);
 }
 
