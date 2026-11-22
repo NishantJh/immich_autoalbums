@@ -279,3 +279,17 @@ export interface PullProgressState {
   error: string | null;
 }
 
+export interface RenameSuggestion {
+  clusterId: string;
+  currentTitle: string;
+  suggestedTitle: string;
+  clusterType: ClusterType;
+  status: ClusterStatus;
+  startDate: string;
+  endDate: string;
+  gapHours: number;
+  timelineLabel: string;
+  reason: string;
+  confidence: 'high' | 'medium';
+  selectedByDefault: boolean;
+}

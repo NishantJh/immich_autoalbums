@@ -419,6 +419,19 @@ export function LibraryIngestView({
                 </>
               )}
             </p>
+            {isPulling && pullProgress && (
+              <div className="mt-3.5 rounded-lg border border-indigo-200/80 dark:border-indigo-500/25 bg-indigo-50/50 dark:bg-indigo-950/20 px-3 py-2.5 text-xs">
+                <div className="flex items-center justify-between gap-2 font-medium text-indigo-900 dark:text-indigo-200">
+                  <span className="truncate">{pullProgress.label || 'Pulling from Immich'}</span>
+                  <span className="font-mono tabular-nums shrink-0">{pullProgress.percent}%</span>
+                </div>
+                {pullProgress.detail && (
+                  <p className="mt-0.5 text-[11px] text-indigo-700/90 dark:text-indigo-300/80 truncate tabular-nums">
+                    {pullProgress.detail}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="mt-5 flex flex-wrap items-center justify-between gap-2 pt-4 border-t border-zinc-100 dark:border-white/[0.06]">
@@ -623,7 +636,21 @@ export function LibraryIngestView({
               SQLite Asset &amp; Feature Cache
             </h2>
             <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
-              Showing {filtered.length.toLocaleString()} of {assets.length.toLocaleString()} indexed assets
+              Showing {filtered.length.toLocaleString()} of{' '}
+              {Math.max(assets.length, pullProgress?.active ? (pullProgress.dbAssetCount ?? 0) : 0).toLocaleString()}{' '}
+              indexed assets
+              {isPulling && pullProgress && (
+                <span className="ml-2 text-indigo-600 dark:text-indigo-400">
+                  ·{' '}
+                  {pullProgress.phase === 'thumbnails'
+                    ? `Writing batches to SQLite (${pullProgress.current.toLocaleString()} / ${pullProgress.total.toLocaleString()} processed)`
+                    : pullProgress.phase === 'clustering'
+                      ? 'Running multi-signal clustering...'
+                      : pullProgress.phase === 'metadata' && pullProgress.current > 0
+                        ? `${pullProgress.current.toLocaleString()} photos discovered — SQLite updates once thumbnail batching starts`
+                        : 'Preparing full library pull...'}
+                </span>
+              )}
             </p>
           </div>
 

@@ -1,6 +1,8 @@
 import {
+  ArrowRight,
   Check,
   CheckSquare,
+  Clock,
   FolderKanban,
   GitMerge,
   Pencil,
@@ -12,15 +14,29 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
-import type { ClusterRecord } from '../shared/types.ts';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ClusterRecord, RenameSuggestion } from '../shared/types.ts';
 import { PaletteBar } from './PaletteBar.tsx';
 import { ThumbnailImage } from './ThumbnailImage.tsx';
 
 interface ReviewQueueViewProps {
   clusters: ClusterRecord[];
   busyId: string | null;
-  onRename: (id: string, title: string) => Promise<void>;
+  onRename: (
+    id: string,
+    title: string,
+    timelineWindowDays?: number
+  ) => Promise<{
+    renameSuggestions: RenameSuggestion[];
+    renamedCluster?: { id: string; oldTitle: string; newTitle: string };
+  }>;
+  onFetchRenameSuggestions: (
+    id: string,
+    oldTitle: string,
+    newTitle: string,
+    timelineWindowDays: number
+  ) => Promise<RenameSuggestion[]>;
+  onBatchRename: (updates: Array<{ id: string; title: string }>) => Promise<boolean>;
   onStatusChange: (id: string, status: 'pending' | 'approved' | 'discarded') => Promise<void>;
   onSyncOne: (id: string) => Promise<void>;
   onMerge: (ids: string[], title?: string) => Promise<void>;
@@ -79,6 +95,8 @@ export function ReviewQueueView({
   clusters,
   busyId,
   onRename,
+  onFetchRenameSuggestions,
+  onBatchRename,
   onStatusChange,
   onSyncOne,
   onMerge,
@@ -92,6 +110,19 @@ export function ReviewQueueView({
   const [draftTitle, setDraftTitle] = useState('');
   const [mergeTitle, setMergeTitle] = useState('');
   const [inspectClusterId, setInspectClusterId] = useState<string | null>(null);
+
+  // Timeline-nearby rename propagation session
+  const [renameSession, setRenameSession] = useState<{
+    sourceId: string;
+    oldTitle: string;
+    newTitle: string;
+    windowDays: number;
+    suggestions: RenameSuggestion[];
+  } | null>(null);
+  const [selectedSuggestionIds, setSelectedSuggestionIds] = useState<string[]>([]);
+  const [suggestionDrafts, setSuggestionDrafts] = useState<Record<string, string>>({});
+  const [refreshingSuggestions, setRefreshingSuggestions] = useState(false);
+  const suggestionCardRef = useRef<HTMLDivElement | null>(null);
 
   const inspectedCluster = useMemo(
     () => clusters.find((c) => c.id === inspectClusterId) || null,
@@ -134,16 +165,93 @@ export function ReviewQueueView({
     );
   };
 
+  const applySuggestionList = (
+    sourceId: string,
+    oldTitle: string,
+    newTitle: string,
+    windowDays: number,
+    suggestions: RenameSuggestion[]
+  ) => {
+    setRenameSession({ sourceId, oldTitle, newTitle, windowDays, suggestions });
+    setSelectedSuggestionIds(
+      suggestions.filter((s) => s.selectedByDefault).map((s) => s.clusterId)
+    );
+    const drafts: Record<string, string> = {};
+    for (const s of suggestions) {
+      drafts[s.clusterId] = s.suggestedTitle;
+    }
+    setSuggestionDrafts(drafts);
+  };
+
   const handleStartRename = (cluster: ClusterRecord) => {
     setEditingId(cluster.id);
     setDraftTitle(cluster.title);
   };
 
   const handleCommitRename = async (id: string) => {
-    if (draftTitle.trim()) {
-      await onRename(id, draftTitle.trim());
+    const trimmed = draftTitle.trim();
+    if (trimmed) {
+      const defaultWindow = renameSession?.windowDays ?? 14;
+      const result = await onRename(id, trimmed, defaultWindow);
+      if (result.renamedCluster && result.renameSuggestions.length > 0) {
+        applySuggestionList(
+          result.renamedCluster.id,
+          result.renamedCluster.oldTitle,
+          result.renamedCluster.newTitle,
+          defaultWindow,
+          result.renameSuggestions
+        );
+        requestAnimationFrame(() => {
+          suggestionCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
+      }
     }
     setEditingId(null);
+  };
+
+  const handleChangeSuggestionWindow = async (nextDays: number) => {
+    if (!renameSession || nextDays === renameSession.windowDays) return;
+    setRefreshingSuggestions(true);
+    try {
+      const next = await onFetchRenameSuggestions(
+        renameSession.sourceId,
+        renameSession.oldTitle,
+        renameSession.newTitle,
+        nextDays
+      );
+      applySuggestionList(
+        renameSession.sourceId,
+        renameSession.oldTitle,
+        renameSession.newTitle,
+        nextDays,
+        next
+      );
+    } finally {
+      setRefreshingSuggestions(false);
+    }
+  };
+
+  const toggleSuggestion = (clusterId: string) => {
+    setSelectedSuggestionIds((prev) =>
+      prev.includes(clusterId) ? prev.filter((x) => x !== clusterId) : [...prev, clusterId]
+    );
+  };
+
+  const handleApplySuggestions = async () => {
+    if (!renameSession || selectedSuggestionIds.length === 0) return;
+    const updates = selectedSuggestionIds
+      .map((cid) => ({
+        id: cid,
+        title: (suggestionDrafts[cid] || '').trim(),
+      }))
+      .filter((u) => u.title.length > 0);
+    if (updates.length === 0) return;
+    const ok = await onBatchRename(updates);
+    if (ok) {
+      setRenameSession(null);
+      setSelectedSuggestionIds([]);
+      setSuggestionDrafts({});
+    }
   };
 
   const handleMergeSubmit = async () => {
@@ -222,6 +330,197 @@ export function ReviewQueueView({
           )}
         </div>
       </div>
+
+      {/* Timeline-Nearby Rename Suggestions Panel */}
+      {renameSession && (
+        <div
+          ref={suggestionCardRef}
+          className="rounded-xl border border-indigo-200/90 dark:border-indigo-500/30 bg-white dark:bg-[#11141B] overflow-hidden"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200/80 dark:border-white/[0.07] bg-indigo-50/50 dark:bg-indigo-950/25 px-5 py-3.5">
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-center gap-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                <Clock className="h-4 w-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
+                <span>Apply rename to nearby albums?</span>
+              </div>
+              <p className="text-xs text-zinc-600 dark:text-zinc-400 flex flex-wrap items-center gap-1.5">
+                <span className="line-through opacity-75">{renameSession.oldTitle}</span>
+                <ArrowRight className="h-3 w-3 shrink-0 text-indigo-500" />
+                <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {renameSession.newTitle}
+                </span>
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <div
+                className="flex items-center gap-0.5 rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0D1017] p-0.5"
+                aria-label="Timeline proximity window"
+              >
+                {[3, 14, 30, 90].map((days) => {
+                  const active = renameSession.windowDays === days;
+                  return (
+                    <button
+                      key={days}
+                      type="button"
+                      disabled={refreshingSuggestions}
+                      onClick={() => void handleChangeSuggestionWindow(days)}
+                      className={`px-2 py-1 text-[11px] font-mono tabular-nums rounded-md transition-colors whitespace-nowrap ${
+                        active
+                          ? 'bg-indigo-600 text-white'
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'
+                      }`}
+                    >
+                      ±{days}d
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setRenameSession(null);
+                  setSelectedSuggestionIds([]);
+                }}
+                aria-label="Dismiss rename suggestions"
+                className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-white/[0.06] hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+
+          {renameSession.suggestions.length === 0 ? (
+            <div className="px-5 py-4 text-xs text-zinc-500 dark:text-zinc-400">
+              No matching albums found within ±{renameSession.windowDays} days. Try widening the timeline window above.
+            </div>
+          ) : (
+            <>
+              <div className="divide-y divide-zinc-100 dark:divide-white/[0.06] max-h-72 overflow-y-auto">
+                {renameSession.suggestions.map((item) => {
+                  const checked = selectedSuggestionIds.includes(item.clusterId);
+                  const draft = suggestionDrafts[item.clusterId] ?? item.suggestedTitle;
+                  return (
+                    <div
+                      key={item.clusterId}
+                      className={`flex flex-col gap-2.5 px-5 py-3 sm:flex-row sm:items-center sm:gap-4 transition-colors ${
+                        checked
+                          ? 'bg-indigo-50/25 dark:bg-indigo-950/15'
+                          : 'opacity-80 hover:opacity-100'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3 min-w-0 flex-1">
+                        <button
+                          type="button"
+                          onClick={() => toggleSuggestion(item.clusterId)}
+                          aria-label={`Toggle rename for ${item.currentTitle}`}
+                          className="mt-0.5 text-indigo-600 dark:text-indigo-400 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded"
+                        >
+                          {checked ? (
+                            <CheckSquare className="h-4 w-4" />
+                          ) : (
+                            <Square className="h-4 w-4 text-zinc-400 dark:text-zinc-500" />
+                          )}
+                        </button>
+                        <div className="min-w-0 flex-1">
+                          <div
+                            className={`text-xs font-medium truncate ${
+                              checked
+                                ? 'line-through text-zinc-500 dark:text-zinc-400'
+                                : 'text-zinc-800 dark:text-zinc-200'
+                            }`}
+                          >
+                            {item.currentTitle}
+                          </div>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                            <span className="font-mono tabular-nums text-indigo-600 dark:text-indigo-400">
+                              {item.timelineLabel}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span>{item.reason}</span>
+                            {item.status === 'synced' && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="text-amber-600 dark:text-amber-400">
+                                  Already synced
+                                </span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 sm:w-[46%] shrink-0">
+                        <ArrowRight className="hidden sm:block h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                        <input
+                          type="text"
+                          value={draft}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setSuggestionDrafts((prev) => ({ ...prev, [item.clusterId]: val }));
+                            if (!checked) {
+                              setSelectedSuggestionIds((prev) => [...prev, item.clusterId]);
+                            }
+                          }}
+                          aria-label={`Proposed title for ${item.currentTitle}`}
+                          className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.10] bg-white dark:bg-[#0A0C10] px-2.5 py-1.5 text-xs font-medium text-zinc-900 dark:text-zinc-100 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-zinc-200/80 dark:border-white/[0.07] bg-zinc-50/80 dark:bg-[#0E1117] px-5 py-3">
+                <div className="flex items-center gap-3 text-xs">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedSuggestionIds(renameSession.suggestions.map((s) => s.clusterId))
+                    }
+                    className="font-medium text-indigo-600 dark:text-indigo-400 hover:underline"
+                  >
+                    Select all ({renameSession.suggestions.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedSuggestionIds([])}
+                    className="text-zinc-500 dark:text-zinc-400 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  >
+                    Clear
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRenameSession(null);
+                      setSelectedSuggestionIds([]);
+                    }}
+                    className="rounded-lg px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200/60 dark:hover:bg-white/[0.06] transition-colors"
+                  >
+                    Skip
+                  </button>
+                  <button
+                    type="button"
+                    disabled={selectedSuggestionIds.length === 0 || busyId === 'rename-batch'}
+                    onClick={() => void handleApplySuggestions()}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 tabular-nums"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    {busyId === 'rename-batch'
+                      ? 'Applying...'
+                      : `Apply to ${selectedSuggestionIds.length} ${
+                          selectedSuggestionIds.length === 1 ? 'Album' : 'Albums'
+                        }`}
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Merge Selection Bar */}
       {selectedIds.length > 0 && (

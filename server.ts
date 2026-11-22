@@ -41,6 +41,7 @@ import {
   splitClusterAtIndex,
   syncClusterIdempotent,
 } from './src/server/pipeline.ts';
+import { computeNearbyRenameSuggestions } from './src/server/renamePropagation.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -380,14 +381,17 @@ async function startServer() {
   });
 
   // Update cluster title or status (rename, approve, discard, restore)
+  // When renamed, also evaluates timeline-nearby albums to propose matching renames.
   app.patch('/api/clusters/:id', (req, res) => {
     const id = String(req.params.id || '').trim();
-    const { title, status } = req.body as {
+    const { title, status, timelineWindowDays } = req.body as {
       title?: string;
       status?: 'pending' | 'approved' | 'discarded';
+      timelineWindowDays?: number;
     };
 
-    const existing = getAllClusters(false).find((c) => c.id === id);
+    const allBefore = getAllClusters(false);
+    const existing = allBefore.find((c) => c.id === id);
     if (!existing) {
       res.status(404).json({ error: 'Cluster not found' });
       return;
@@ -405,7 +409,121 @@ async function startServer() {
       .prepare('UPDATE clusters SET title = ?, status = ?, updated_at = ? WHERE id = ?')
       .run(nextTitle, nextStatus, new Date().toISOString(), id);
 
-    res.json({ clusters: getAllClusters(true) });
+    const windowDays =
+      typeof timelineWindowDays === 'number' &&
+      Number.isFinite(timelineWindowDays) &&
+      timelineWindowDays >= 1 &&
+      timelineWindowDays <= 365
+        ? Math.round(timelineWindowDays)
+        : 14;
+
+    const titleChanged = nextTitle !== existing.title;
+    const renameSuggestions = titleChanged
+      ? computeNearbyRenameSuggestions(
+          existing,
+          existing.title,
+          nextTitle,
+          allBefore,
+          windowDays
+        )
+      : [];
+
+    res.json({
+      clusters: getAllClusters(true),
+      renameSuggestions,
+      ...(titleChanged
+        ? {
+            renamedCluster: {
+              id,
+              oldTitle: existing.title,
+              newTitle: nextTitle,
+            },
+          }
+        : {}),
+    });
+  });
+
+  // Re-evaluate nearby rename suggestions for an edited album with a custom timeline window
+  app.post('/api/clusters/:id/rename-suggestions', (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const { oldTitle, newTitle, timelineWindowDays } = req.body as {
+      oldTitle?: string;
+      newTitle?: string;
+      timelineWindowDays?: number;
+    };
+
+    const allClusters = getAllClusters(false);
+    const source = allClusters.find((c) => c.id === id);
+    if (!source) {
+      res.status(404).json({ error: 'Cluster not found' });
+      return;
+    }
+
+    const cleanOld = typeof oldTitle === 'string' ? oldTitle.trim() : '';
+    const cleanNew = typeof newTitle === 'string' ? newTitle.trim() : source.title;
+    const windowDays =
+      typeof timelineWindowDays === 'number' &&
+      Number.isFinite(timelineWindowDays) &&
+      timelineWindowDays >= 1 &&
+      timelineWindowDays <= 365
+        ? Math.round(timelineWindowDays)
+        : 14;
+
+    const renameSuggestions = computeNearbyRenameSuggestions(
+      source,
+      cleanOld,
+      cleanNew,
+      allClusters,
+      windowDays
+    );
+
+    res.json({ renameSuggestions });
+  });
+
+  // Atomically apply batch renames selected from nearby timeline suggestions
+  app.post('/api/clusters/rename-batch', (req, res) => {
+    try {
+      const { updates } = req.body as {
+        updates?: Array<{ id?: string; title?: string }>;
+      };
+
+      if (!Array.isArray(updates) || updates.length === 0 || updates.length > 200) {
+        res.status(400).json({ error: 'Provide between 1 and 200 album rename updates.' });
+        return;
+      }
+
+      const cleanUpdates: Array<{ id: string; title: string }> = [];
+      for (const item of updates) {
+        const cid = typeof item?.id === 'string' ? item.id.trim() : '';
+        const nextTitle = typeof item?.title === 'string' ? item.title.trim().slice(0, 140) : '';
+        if (cid && nextTitle) {
+          cleanUpdates.push({ id: cid, title: nextTitle });
+        }
+      }
+
+      if (cleanUpdates.length === 0) {
+        res.status(400).json({ error: 'No valid album titles provided.' });
+        return;
+      }
+
+      const db = getDb();
+      const now = new Date().toISOString();
+      const stmt = db.prepare('UPDATE clusters SET title = ?, updated_at = ? WHERE id = ?');
+      let updatedCount = 0;
+
+      db.transaction(() => {
+        for (const u of cleanUpdates) {
+          const info = stmt.run(u.title, now, u.id);
+          updatedCount += info.changes;
+        }
+      })();
+
+      res.json({ updatedCount, clusters: getAllClusters(true) });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Batch rename failed',
+      });
+    }
   });
 
   // Merge selected clusters

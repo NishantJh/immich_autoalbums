@@ -11,6 +11,7 @@ import type {
   PipelineRunSummary,
   SyncHistoryRecord,
 } from '../shared/types.ts';
+import { sanitizePlaceName } from './placeUtils.ts';
 
 export const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
@@ -253,7 +254,7 @@ export function saveSettings(partial: Partial<OrganizerSettings>): OrganizerSett
       clampNum(partial.scanIntervalHours ?? current.scanIntervalHours, 1, 168)
     ),
     maxAssetsPerPull: Math.round(
-      clampNum(partial.maxAssetsPerPull ?? current.maxAssetsPerPull, 0, 100000)
+      clampNum(partial.maxAssetsPerPull ?? current.maxAssetsPerPull, 0, 500000)
     ),
     lastScanAt:
       partial.lastScanAt !== undefined ? partial.lastScanAt : current.lastScanAt,
@@ -318,8 +319,8 @@ export function rowToAsset(row: DbAssetRow): AssetRecord {
     fileName: row.file_name,
     originalPath: row.original_path,
     localDateTime: row.local_date_time,
-    city: row.city,
-    state: row.state ?? null,
+    city: sanitizePlaceName(row.city, row.country),
+    state: sanitizePlaceName(row.state, row.country),
     country: row.country,
     latitude: row.latitude,
     longitude: row.longitude,
@@ -388,10 +389,27 @@ export function getPipelineSummary(): PipelineRunSummary | null {
   const row = getDb()
     .prepare('SELECT value_json FROM app_state WHERE key = ?')
     .get('pipeline_summary') as { value_json: string } | undefined;
-  return row ? (JSON.parse(row.value_json) as PipelineRunSummary) : null;
+  if (!row) return null;
+  const parsed = JSON.parse(row.value_json) as PipelineRunSummary;
+  if (parsed?.stage2) {
+    const cleanHome = sanitizePlaceName(parsed.stage2.homeBaseCity, parsed.stage2.homeBaseCountry);
+    if (cleanHome) {
+      parsed.stage2.homeBaseCity = cleanHome;
+    }
+    if (Array.isArray(parsed.stage2.candidateHomeBases)) {
+      parsed.stage2.candidateHomeBases = parsed.stage2.candidateHomeBases.map((c) => ({
+        ...c,
+        city: sanitizePlaceName(c.city, c.country) || c.city,
+      }));
+    }
+  }
+  return parsed;
 }
 
-export function getAllClusters(includeAssets = true): ClusterRecord[] {
+export function getAllClusters(
+  includeAssets = true,
+  preloadedAssets?: AssetRecord[]
+): ClusterRecord[] {
   const db = getDb();
   const rows = db
     .prepare('SELECT * FROM clusters ORDER BY start_date DESC, parent_event_id ASC, id ASC')
@@ -422,7 +440,8 @@ export function getAllClusters(includeAssets = true): ClusterRecord[] {
 
   const assetMap = new Map<string, AssetRecord>();
   if (includeAssets) {
-    for (const a of getAllAssets()) {
+    const sourceAssets = preloadedAssets ?? getAllAssets();
+    for (const a of sourceAssets) {
       assetMap.set(a.id, a);
     }
   }

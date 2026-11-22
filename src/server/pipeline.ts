@@ -100,25 +100,62 @@ function pickBucketCity(
   cities: Map<string, number>,
   country: string | null,
   fallbackLat: number,
-  fallbackLng: number
+  fallbackLng: number,
+  states?: Map<string, number>
 ): string {
   const allowCyrillic = country ? CYRILLIC_COUNTRY_RE.test(country) : false;
-  const entries = Array.from(cities.entries()).sort((x, y) => y[1] - x[1]);
+  const countryLower = (country || '').trim().toLowerCase();
+  const stateKeysLower = new Set(
+    Array.from(states?.keys() || []).map((s) => s.trim().toLowerCase())
+  );
 
-  // First prefer clean Latin-script names (or any name if inside a Cyrillic-script country)
-  for (const [name] of entries) {
-    if (allowCyrillic || !CYRILLIC_RE.test(name)) {
-      return name;
+  const validCityEntries = Array.from(cities.entries())
+    .filter(([name]) => {
+      const n = name.trim();
+      if (!n || n.toLowerCase() === 'away' || n.toLowerCase() === 'unknown') return false;
+      // Never let country name outvote a specific city inside the city map
+      if (countryLower && n.toLowerCase() === countryLower) return false;
+      return allowCyrillic || !CYRILLIC_RE.test(n);
+    })
+    .sort((x, y) => y[1] - x[1]);
+
+  // 1a. Prefer genuine specific cities (not matching a state/province fallback)
+  const specificCity = validCityEntries.find(
+    ([name]) => !stateKeysLower.has(name.trim().toLowerCase())
+  );
+  if (specificCity) {
+    return specificCity[0];
+  }
+
+  // 1b. Any remaining valid city entry
+  if (validCityEntries.length > 0) {
+    return validCityEntries[0][0];
+  }
+
+  // 2. Fall back to state / province / region before country
+  if (states && states.size > 0) {
+    const stateEntries = Array.from(states.entries())
+      .filter(([name]) => {
+        const n = name.trim();
+        if (!n) return false;
+        if (countryLower && n.toLowerCase() === countryLower) return false;
+        return allowCyrillic || !CYRILLIC_RE.test(n);
+      })
+      .sort((x, y) => y[1] - x[1]);
+    if (stateEntries.length > 0) {
+      return stateEntries[0][0];
     }
   }
 
-  if (country && !CYRILLIC_RE.test(country)) {
+  // 3. Fall back to country only when no city or state exists anywhere in the bucket
+  if (country && (allowCyrillic || !CYRILLIC_RE.test(country))) {
     return country;
   }
-  if (entries.length > 0 && allowCyrillic) {
-    return entries[0][0];
+
+  if (Number.isFinite(fallbackLat) && Number.isFinite(fallbackLng) && (fallbackLat !== 0 || fallbackLng !== 0)) {
+    return `${fallbackLat.toFixed(2)}, ${fallbackLng.toFixed(2)}`;
   }
-  return `${fallbackLat.toFixed(2)}, ${fallbackLng.toFixed(2)}`;
+  return 'Away';
 }
 
 function encodeGeohash5(lat: number, lng: number): string {
@@ -588,6 +625,7 @@ export function runFullPipeline(): {
       latSum: number;
       lngSum: number;
       cities: Map<string, number>;
+      states: Map<string, number>;
       countries: Map<string, number>;
     }
   >();
@@ -600,7 +638,7 @@ export function runFullPipeline(): {
         .filter((a) => !a.isArchived && !a.isTrashed && isValidGps(a.latitude, a.longitude));
 
   for (const a of gpsSourceAssets) {
-    const { latitude, longitude, city, country } = a;
+    const { latitude, longitude, city, state, country } = a;
     if (!isValidGps(latitude, longitude) || longitude === null) continue;
     const gh = encodeGeohash5(latitude, longitude);
     const bucket = geohashBuckets.get(gh) || {
@@ -609,16 +647,23 @@ export function runFullPipeline(): {
       latSum: 0,
       lngSum: 0,
       cities: new Map(),
+      states: new Map(),
       countries: new Map(),
     };
     bucket.count++;
     bucket.days.add((a.localDateTime || '').slice(0, 10));
     bucket.latSum += latitude;
     bucket.lngSum += longitude;
-    const cleanCity = sanitizePlaceName(city, country);
-    if (cleanCity) bucket.cities.set(cleanCity, (bucket.cities.get(cleanCity) || 0) + 1);
-    if (country && country.trim()) {
-      const cTrim = country.trim();
+    const cTrim = country && country.trim() ? country.trim() : null;
+    const cleanCity = sanitizePlaceName(city, cTrim);
+    if (cleanCity && (!cTrim || cleanCity.toLowerCase() !== cTrim.toLowerCase())) {
+      bucket.cities.set(cleanCity, (bucket.cities.get(cleanCity) || 0) + 1);
+    }
+    const cleanState = sanitizePlaceName(state, cTrim);
+    if (cleanState && (!cTrim || cleanState.toLowerCase() !== cTrim.toLowerCase())) {
+      bucket.states.set(cleanState, (bucket.states.get(cleanState) || 0) + 1);
+    }
+    if (cTrim) {
       bucket.countries.set(cTrim, (bucket.countries.get(cTrim) || 0) + 1);
     }
     geohashBuckets.set(gh, bucket);
@@ -631,7 +676,7 @@ export function runFullPipeline(): {
       const avgLng = b.lngSum / b.count;
       const topCountry =
         Array.from(b.countries.entries()).sort((x, y) => y[1] - x[1])[0]?.[0] || null;
-      const topCity = pickBucketCity(b.cities, topCountry, avgLat, avgLng);
+      const topCity = pickBucketCity(b.cities, topCountry, avgLat, avgLng, b.states);
       return {
         city: topCity,
         country: topCountry,
@@ -765,15 +810,16 @@ export function runFullPipeline(): {
     // Same city continuity
     if (prev.asset.city && next.asset.city && prev.asset.city === next.asset.city) return true;
 
-    // Road-trip / multi-stop bridge (120–320 km) reinforced by State/Country + ML tags + Faces + Chroma
-    const sameRegionAdmin =
-      (prev.asset.state && next.asset.state && prev.asset.state === next.asset.state) ||
-      (prev.asset.country && next.asset.country && prev.asset.country === next.asset.country);
-    if (sameRegionAdmin) {
+    // Road-trip / multi-stop bridge (120–260 km) reinforced by same State + ML tags + Faces + Chroma
+    const sameState =
+      Boolean(prev.asset.state && next.asset.state && prev.asset.state === next.asset.state);
+    const sameCountry =
+      Boolean(prev.asset.country && next.asset.country && prev.asset.country === next.asset.country);
+    if (sameState || (sameCountry && distKm !== null && distKm <= 200)) {
       const mlOverlap = jaccardSimilarity(prev.asset.smartTags, next.asset.smartTags);
       const peopleOverlap = jaccardSimilarity(prev.asset.peopleIds, next.asset.peopleIds);
       const chromaSim = 1 - computeLabHistogramEmd(prev.histogram, next.histogram);
-      if (peopleOverlap > 0 || mlOverlap >= 0.25 || chromaSim >= 0.68) {
+      if (peopleOverlap > 0 || mlOverlap >= 0.35 || (sameState && chromaSim >= 0.72)) {
         return true;
       }
     }
@@ -849,18 +895,27 @@ export function runFullPipeline(): {
     }
   }
 
-  // Finalize Macro Trips
+  // Finalize Macro Trips (strict place specificity: City -> State -> Country -> GPS)
   for (const bucket of rawTripBuckets) {
     bucket.sort((x, y) => x.timestampMs - y.timestampMs);
     if (bucket.length >= settings.minPhotosPerAlbum) {
       const cityCounts = new Map<string, number>();
+      const stateCounts = new Map<string, number>();
       const countryCounts = new Map<string, number>();
       for (const a of bucket) {
-        const cleanC = sanitizePlaceName(a.asset.city, a.asset.country);
-        const c = cleanC || a.asset.country || 'Away';
-        cityCounts.set(c, (cityCounts.get(c) || 0) + 1);
-        if (a.asset.country) {
-          countryCounts.set(a.asset.country, (countryCounts.get(a.asset.country) || 0) + 1);
+        const rawCountry = a.asset.country && a.asset.country.trim() ? a.asset.country.trim() : null;
+        const cleanCity = sanitizePlaceName(a.asset.city, rawCountry);
+        const cleanState = sanitizePlaceName(a.asset.state, rawCountry);
+
+        // Only count real city names in cityCounts — never let country or 'Away' outvote a specific city
+        if (cleanCity && (!rawCountry || cleanCity.toLowerCase() !== rawCountry.toLowerCase())) {
+          cityCounts.set(cleanCity, (cityCounts.get(cleanCity) || 0) + 1);
+        }
+        if (cleanState && (!rawCountry || cleanState.toLowerCase() !== rawCountry.toLowerCase())) {
+          stateCounts.set(cleanState, (stateCounts.get(cleanState) || 0) + 1);
+        }
+        if (rawCountry) {
+          countryCounts.set(rawCountry, (countryCounts.get(rawCountry) || 0) + 1);
         }
       }
       const country =
@@ -870,7 +925,8 @@ export function runFullPipeline(): {
         cityCounts,
         country,
         centroid?.lat || 0,
-        centroid?.lng || 0
+        centroid?.lng || 0,
+        stateCounts
       );
       const locationLabel = country && country !== topCity ? `${topCity}, ${country}` : topCity;
       rawEvents.push({
@@ -1041,15 +1097,29 @@ export function runFullPipeline(): {
         pickTopOccasion(members) ||
         pickGuestCompanionTitle(members, householdPeople) ||
         `Local Gathering #${localIdx}`;
-      const rawMemberCity = members.find((m) =>
-        sanitizePlaceName(m.asset.city, m.asset.country)
-      );
+      const localCityCounts = new Map<string, number>();
+      const localStateCounts = new Map<string, number>();
+      let localCountry: string | null = null;
+      for (const m of members) {
+        const cTrim = m.asset.country && m.asset.country.trim() ? m.asset.country.trim() : null;
+        if (cTrim && !localCountry) localCountry = cTrim;
+        const cleanC = sanitizePlaceName(m.asset.city, cTrim);
+        if (cleanC && (!cTrim || cleanC.toLowerCase() !== cTrim.toLowerCase())) {
+          localCityCounts.set(cleanC, (localCityCounts.get(cleanC) || 0) + 1);
+        }
+        const cleanS = sanitizePlaceName(m.asset.state, cTrim);
+        if (cleanS && (!cTrim || cleanS.toLowerCase() !== cTrim.toLowerCase())) {
+          localStateCounts.set(cleanS, (localStateCounts.get(cleanS) || 0) + 1);
+        }
+      }
+      const pickedLocalCity =
+        localCityCounts.size > 0 || localStateCounts.size > 0
+          ? pickBucketCity(localCityCounts, localCountry, 0, 0, localStateCounts)
+          : null;
       const city =
-        (rawMemberCity
-          ? sanitizePlaceName(rawMemberCity.asset.city, rawMemberCity.asset.country)
-          : null) ||
+        (pickedLocalCity && pickedLocalCity !== 'Away' ? pickedLocalCity : null) ||
         (hasActiveHomeBase ? homeCity : 'Local');
-      const country = members.find((m) => m.asset.country)?.asset.country;
+      const country = localCountry;
       const locationLabel = country && country !== city ? `${city}, ${country}` : city;
 
       rawEvents.push({

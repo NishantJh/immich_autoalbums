@@ -1025,13 +1025,17 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
           const hasCyrillic = (s: string) => /[\u0400-\u04FF]/.test(s);
           let resolvedCity: string | null = rawCity || null;
           if (resolvedCity && !isCyrillicCountry && hasCyrillic(resolvedCity)) {
-            resolvedCity =
-              rawState && !hasCyrillic(rawState)
-                ? rawState
-                : rawCountry && !hasCyrillic(rawCountry)
-                  ? rawCountry
-                  : null;
+            resolvedCity = null;
           }
+          if (resolvedCity && rawCountry && resolvedCity.toLowerCase() === rawCountry.toLowerCase()) {
+            resolvedCity = null;
+          }
+          const resolvedState =
+            rawState &&
+            !(!isCyrillicCountry && hasCyrillic(rawState)) &&
+            (!rawCountry || rawState.toLowerCase() !== rawCountry.toLowerCase())
+              ? rawState
+              : null;
 
           const peopleList = row.item.people || [];
           const peopleIds = peopleList.map((p) => p.id).filter(Boolean);
@@ -1045,7 +1049,7 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
             original_path: row.origPath,
             local_date_time: row.item.localDateTime || row.item.fileCreatedAt || now,
             city: resolvedCity,
-            state: rawState && !(!isCyrillicCountry && hasCyrillic(rawState)) ? rawState : null,
+            state: resolvedState,
             country: rawCountry || null,
             latitude: hasValidCoords ? rawLat : null,
             longitude: hasValidCoords ? rawLng : null,

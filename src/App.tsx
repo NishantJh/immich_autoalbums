@@ -29,6 +29,7 @@ import type {
   OrganizerSettings,
   PipelineRunSummary,
   PullProgressState,
+  RenameSuggestion,
   SyncHistoryRecord,
 } from './shared/types.ts';
 
@@ -307,20 +308,90 @@ export default function App() {
     }
   };
 
-  const handleRename = async (id: string, title: string) => {
+  const handleRename = async (
+    id: string,
+    title: string,
+    timelineWindowDays = 14
+  ): Promise<{
+    renameSuggestions: RenameSuggestion[];
+    renamedCluster?: { id: string; oldTitle: string; newTitle: string };
+  }> => {
     setBusyId(id);
     try {
       const res = await fetch(`/api/clusters/${encodeURIComponent(id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify({ title, timelineWindowDays }),
       });
       if (!res.ok) throw new Error('Rename failed');
-      const data = (await res.json()) as { clusters: ClusterRecord[] };
+      const data = (await res.json()) as {
+        clusters: ClusterRecord[];
+        renameSuggestions?: RenameSuggestion[];
+        renamedCluster?: { id: string; oldTitle: string; newTitle: string };
+      };
       setClusters(data.clusters);
-      notify('Album title updated.');
+      const count = data.renameSuggestions?.length || 0;
+      notify(
+        count > 0
+          ? `Album title updated — ${count} nearby ${count === 1 ? 'album' : 'albums'} can adopt this change.`
+          : 'Album title updated.'
+      );
+      return {
+        renameSuggestions: data.renameSuggestions || [],
+        renamedCluster: data.renamedCluster,
+      };
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Rename failed', 'err');
+      return { renameSuggestions: [] };
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleFetchRenameSuggestions = async (
+    id: string,
+    oldTitle: string,
+    newTitle: string,
+    timelineWindowDays: number
+  ): Promise<RenameSuggestion[]> => {
+    try {
+      const res = await fetch(`/api/clusters/${encodeURIComponent(id)}/rename-suggestions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ oldTitle, newTitle, timelineWindowDays }),
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { renameSuggestions?: RenameSuggestion[] };
+      return data.renameSuggestions || [];
+    } catch {
+      return [];
+    }
+  };
+
+  const handleBatchRename = async (
+    updates: Array<{ id: string; title: string }>
+  ): Promise<boolean> => {
+    if (updates.length === 0) return false;
+    setBusyId('rename-batch');
+    try {
+      const res = await fetch('/api/clusters/rename-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ updates }),
+      });
+      const data = (await res.json()) as {
+        error?: string;
+        updatedCount?: number;
+        clusters?: ClusterRecord[];
+      };
+      if (!res.ok || !data.clusters) throw new Error(data.error || 'Batch rename failed');
+      setClusters(data.clusters);
+      const n = data.updatedCount ?? updates.length;
+      notify(`Updated ${n} nearby album ${n === 1 ? 'title' : 'titles'}.`);
+      return true;
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Batch rename failed', 'err');
+      return false;
     } finally {
       setBusyId(null);
     }
@@ -1014,6 +1085,8 @@ export default function App() {
                   clusters={clusters}
                   busyId={busyId}
                   onRename={handleRename}
+                  onFetchRenameSuggestions={handleFetchRenameSuggestions}
+                  onBatchRename={handleBatchRename}
                   onStatusChange={handleStatusChange}
                   onSyncOne={handleSyncOne}
                   onMerge={handleMerge}
