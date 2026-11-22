@@ -14,9 +14,10 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { LibraryIngestView } from './components/LibraryIngestView.tsx';
 import { PipelineLabView } from './components/PipelineLabView.tsx';
+import { PullProgressBanner } from './components/PullProgressBanner.tsx';
 import { ReviewQueueView } from './components/ReviewQueueView.tsx';
 import { RulesDeployView } from './components/RulesDeployView.tsx';
 import { SyncLedgerView } from './components/SyncLedgerView.tsx';
@@ -27,6 +28,7 @@ import type {
   ImmichStatus,
   OrganizerSettings,
   PipelineRunSummary,
+  PullProgressState,
   SyncHistoryRecord,
 } from './shared/types.ts';
 
@@ -81,6 +83,8 @@ export default function App() {
   const [toast, setToast] = useState<{ text: string; tone: 'ok' | 'err' } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [pullProgress, setPullProgress] = useState<PullProgressState | null>(null);
+  const wasPullActiveRef = useRef(false);
 
   const [immichStatus, setImmichStatus] = useState<ImmichStatus>({
     configured: false,
@@ -139,9 +143,87 @@ export default function App() {
     }
   }, []);
 
+  const refreshBootstrapSilent = useCallback(async () => {
+    try {
+      const res = await fetch('/api/bootstrap');
+      if (!res.ok) return;
+      const data = (await res.json()) as DashboardBootstrap;
+      setImmichStatus(data.immichStatus);
+      setSettings(data.settings);
+      setClusters(data.clusters);
+      setAssets(data.assets);
+      setPipelineSummary(data.pipelineSummary);
+      setSyncHistory(data.syncHistory);
+    } catch {
+      // Non-fatal silent refresh
+    }
+  }, []);
+
   useEffect(() => {
     void loadBootstrap();
+    // Reconnect to any in-progress server pull if user refreshed mid-pull
+    void (async () => {
+      try {
+        const res = await fetch('/api/pipeline/progress');
+        if (!res.ok) return;
+        const data = (await res.json()) as { progress: PullProgressState };
+        if (data.progress?.active) {
+          wasPullActiveRef.current = true;
+          setPullProgress(data.progress);
+          setIsScanning(true);
+        }
+      } catch {
+        // Ignore initial probe error
+      }
+    })();
   }, [loadBootstrap]);
+
+  // Poll live pull progress every 400ms while a pull job is running
+  useEffect(() => {
+    if (!pullProgress?.active) return;
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/pipeline/progress');
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { progress: PullProgressState };
+        const next = data.progress;
+        setPullProgress(next);
+
+        if (!next.active && wasPullActiveRef.current) {
+          wasPullActiveRef.current = false;
+          setIsScanning(false);
+          setBusyId((curr) => (curr === 'immich-ingest' ? null : curr));
+          await refreshBootstrapSilent();
+          if (next.phase === 'error') {
+            notify(next.error || 'Immich pull failed', 'err');
+          } else if (next.phase === 'done') {
+            notify(next.detail || 'Pull & scan complete.');
+          }
+        }
+      } catch {
+        // Retry next interval
+      }
+    };
+
+    const timer = setInterval(() => void poll(), 400);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [pullProgress?.active, refreshBootstrapSilent, notify]);
+
+  const handleCancelPull = async () => {
+    try {
+      const res = await fetch('/api/pipeline/cancel', { method: 'POST' });
+      if (!res.ok) return;
+      const data = (await res.json()) as { progress: PullProgressState };
+      setPullProgress(data.progress);
+    } catch {
+      // Non-fatal
+    }
+  };
 
   const handleRunPipeline = async () => {
     setIsScanning(true);
@@ -150,43 +232,49 @@ export default function App() {
       const res = await fetch('/api/pipeline/run', { method: 'POST' });
       const data = (await res.json()) as {
         error?: string;
+        started?: boolean;
+        progress?: PullProgressState;
         mode?: 'live_immich' | 'local_fallback' | 'local_cache';
         ingested?: number;
         immichWarning?: string;
         immichStatus?: ImmichStatus;
-        summary: PipelineRunSummary;
-        clusters: ClusterRecord[];
-        assets: AssetRecord[];
+        summary?: PipelineRunSummary;
+        clusters?: ClusterRecord[];
+        assets?: AssetRecord[];
       };
       if (!res.ok) throw new Error(data.error || 'Pipeline run failed');
+
+      if (data.immichStatus) setImmichStatus(data.immichStatus);
+
+      // Async live Immich pull started — progress banner & polling take over
+      if (data.started && data.progress) {
+        wasPullActiveRef.current = true;
+        setPullProgress(data.progress);
+        return;
+      }
 
       const elapsed = Date.now() - started;
       if (elapsed < 300) {
         await new Promise((r) => setTimeout(r, 300 - elapsed));
       }
 
-      if (data.immichStatus) setImmichStatus(data.immichStatus);
-      setPipelineSummary(data.summary);
-      setClusters(data.clusters);
-      setAssets(data.assets);
+      if (data.summary) setPipelineSummary(data.summary);
+      if (data.clusters) setClusters(data.clusters);
+      if (data.assets) setAssets(data.assets);
 
-      if (data.mode === 'live_immich') {
+      if (data.mode === 'local_fallback') {
         notify(
-          `Pulled ${data.ingested ?? 0} assets from Immich and scanned in ${data.summary.durationMs} ms — ${data.clusters.length} album proposals ready.`
-        );
-      } else if (data.mode === 'local_fallback') {
-        notify(
-          `Immich unreachable (${data.immichWarning || 'check URL/key'}). Scanned ${data.summary.stage1.eligibleAssets} local cached assets.`,
+          `Immich unreachable (${data.immichWarning || 'check URL/key'}). Scanned ${data.summary?.stage1.eligibleAssets ?? 0} local cached assets.`,
           'err'
         );
       } else {
         notify(
-          `Scan complete in ${data.summary.durationMs} ms — evaluated ${data.summary.stage1.eligibleAssets} eligible assets into ${data.clusters.length} album proposals.`
+          `Scan complete in ${data.summary?.durationMs ?? 0} ms — evaluated ${data.summary?.stage1.eligibleAssets ?? 0} eligible assets into ${data.clusters?.length ?? 0} album proposals.`
         );
       }
+      setIsScanning(false);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Scan failed', 'err');
-    } finally {
       setIsScanning(false);
     }
   };
@@ -368,11 +456,13 @@ export default function App() {
         settings: OrganizerSettings;
         summary?: PipelineRunSummary;
         clusters?: ClusterRecord[];
+        assets?: AssetRecord[];
       };
       if (!res.ok) throw new Error(data.error || 'Failed to save settings');
       setSettings(data.settings);
       if (data.summary) setPipelineSummary(data.summary);
       if (data.clusters) setClusters(data.clusters);
+      if (data.assets) setAssets(data.assets);
       notify('Settings saved and pipeline refreshed.');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to save settings';
@@ -510,25 +600,38 @@ export default function App() {
     }
   };
 
-  const handleIngestImmich = async () => {
+  const handleIngestImmich = async (options?: {
+    maxAssets?: number;
+    takenAfter?: string;
+    takenBefore?: string;
+  }) => {
     setBusyId('immich-ingest');
+    setIsScanning(true);
     try {
-      const res = await fetch('/api/immich/ingest', { method: 'POST' });
+      const res = await fetch('/api/immich/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(options || {}),
+      });
       const data = (await res.json()) as {
         error?: string;
-        ingested: number;
-        summary: PipelineRunSummary;
-        clusters: ClusterRecord[];
+        started?: boolean;
+        progress?: PullProgressState;
       };
       if (!res.ok) throw new Error(data.error || 'Immich ingest failed');
-      setPipelineSummary(data.summary);
-      setClusters(data.clusters);
-      await loadBootstrap();
-      notify(`Pulled ${data.ingested} assets from Immich and rebuilt clusters.`);
+
+      if (data.started && data.progress) {
+        wasPullActiveRef.current = true;
+        setPullProgress(data.progress);
+        return;
+      }
+      await refreshBootstrapSilent();
+      setBusyId(null);
+      setIsScanning(false);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Immich ingest failed', 'err');
-    } finally {
       setBusyId(null);
+      setIsScanning(false);
     }
   };
 
@@ -769,17 +872,21 @@ export default function App() {
 
             <button
               type="button"
-              disabled={isScanning}
-              aria-busy={isScanning}
+              disabled={isScanning || Boolean(pullProgress?.active)}
+              aria-busy={isScanning || Boolean(pullProgress?.active)}
               onClick={handleRunPipeline}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-[#0E1117]"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-[#0E1117]"
             >
-              {isScanning ? (
+              {isScanning || pullProgress?.active ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Play className="h-3.5 w-3.5" />
               )}
-              {isScanning ? 'Scanning...' : 'Run Scan'}
+              {pullProgress?.active
+                ? `Scanning ${pullProgress.percent}%...`
+                : isScanning
+                  ? 'Scanning...'
+                  : 'Run Scan'}
             </button>
           </div>
         </header>
@@ -796,6 +903,11 @@ export default function App() {
             </p>
           </div>
 
+          {/* Live Immich Pull & Scan Progress Banner */}
+          {pullProgress?.active && (
+            <PullProgressBanner progress={pullProgress} onCancel={handleCancelPull} />
+          )}
+
           {/* 4-Column Single-Elevation Summary Strip */}
           {pipelineSummary && (
             <div className="grid grid-cols-2 divide-y divide-zinc-200/80 dark:divide-white/[0.07] rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] sm:grid-cols-4 sm:divide-y-0 sm:divide-x">
@@ -811,21 +923,38 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="px-5 py-4">
-                <div className="text-xs text-zinc-500 dark:text-zinc-400">Inferred Home Base</div>
+              <button
+                type="button"
+                onClick={() => setSection('rules')}
+                className="group px-5 py-4 text-left hover:bg-zinc-50/80 dark:hover:bg-white/[0.02] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500"
+              >
+                <div className="flex items-center justify-between gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+                  <span>
+                    {pipelineSummary.stage2.homeBaseSource === 'manual'
+                      ? 'Manual Home Base'
+                      : pipelineSummary.stage2.homeBaseSource === 'disabled'
+                        ? 'Home Base'
+                        : 'Inferred Home Base'}
+                  </span>
+                  <span className="text-[11px] font-medium text-indigo-600 dark:text-indigo-400 opacity-80 group-hover:opacity-100">
+                    Change
+                  </span>
+                </div>
                 <div className="mt-1.5 flex items-baseline gap-2 min-w-0">
                   <span className="text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 truncate">
                     {hasHomeBase ? pipelineSummary.stage2.homeBaseCity : '—'}
                   </span>
                   {hasHomeBase &&
-                    pipelineSummary.stage2.homeBaseGeohash &&
-                    pipelineSummary.stage2.homeBaseGeohash !== '—' && (
-                      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono shrink-0">
-                        {pipelineSummary.stage2.homeBaseGeohash}
+                    pipelineSummary.stage2.homeBaseSource !== 'disabled' &&
+                    pipelineSummary.stage2.homeBaseCountry &&
+                    pipelineSummary.stage2.homeBaseCountry !==
+                      pipelineSummary.stage2.homeBaseCity && (
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400 truncate shrink-0">
+                        {pipelineSummary.stage2.homeBaseCountry}
                       </span>
                     )}
                 </div>
-              </div>
+              </button>
 
               <div className="px-5 py-4">
                 <div className="text-xs text-zinc-500 dark:text-zinc-400">CIELAB Scene Splits</div>
@@ -902,6 +1031,7 @@ export default function App() {
                     handleSaveSettings({ settings: partial, rerun: true })
                   }
                   onClearCacheAndRun={handleClearCacheAndRun}
+                  onOpenRules={() => setSection('rules')}
                 />
               )}
 
@@ -919,6 +1049,8 @@ export default function App() {
                 <LibraryIngestView
                   assets={assets}
                   immichStatus={immichStatus}
+                  settings={settings}
+                  pullProgress={pullProgress}
                   busyAction={busyId}
                   onUploadPhotos={handleUploadPhotos}
                   onSaveImmichConfig={handleSaveImmichConfig}
@@ -932,6 +1064,7 @@ export default function App() {
               {section === 'rules' && (
                 <RulesDeployView
                   settings={settings}
+                  pipelineSummary={pipelineSummary}
                   isBusy={isScanning}
                   onSaveSettings={handleSaveSettings}
                 />

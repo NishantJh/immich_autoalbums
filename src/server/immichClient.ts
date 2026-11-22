@@ -1,8 +1,105 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import type { ImmichStatus } from '../shared/types.ts';
-import { DATA_DIR, getDb, purgeDemoAssets, THUMBNAIL_DIR } from './db.ts';
+import type { ImmichStatus, PullPhase, PullProgressState } from '../shared/types.ts';
+import { decodeImageBufferToRgba, extractColorFeaturesFromPixels } from './colorLab.ts';
+import { DATA_DIR, getDb, getSettings, purgeDemoAssets, THUMBNAIL_DIR } from './db.ts';
+
+let pullProgress: PullProgressState = {
+  active: false,
+  phase: 'idle',
+  percent: 0,
+  label: '',
+  detail: '',
+  current: 0,
+  total: 0,
+  cachedCount: 0,
+  ingestedCount: 0,
+  cancelRequested: false,
+  startedAt: null,
+  updatedAt: new Date().toISOString(),
+  error: null,
+};
+
+let cancelRequestedFlag = false;
+
+export function isPullRunning(): boolean {
+  return pullProgress.active;
+}
+
+export function getPullProgress(): PullProgressState {
+  return { ...pullProgress };
+}
+
+export function requestCancelPull(): PullProgressState {
+  if (pullProgress.active) {
+    cancelRequestedFlag = true;
+    pullProgress = {
+      ...pullProgress,
+      cancelRequested: true,
+      detail: 'Stopping after current batch and clustering photos pulled so far...',
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return { ...pullProgress };
+}
+
+export function setPullProgress(
+  patch: Partial<PullProgressState> & { phase: PullPhase }
+): void {
+  const now = new Date().toISOString();
+  pullProgress = {
+    ...pullProgress,
+    ...patch,
+    percent: Math.max(0, Math.min(100, Math.round(patch.percent ?? pullProgress.percent))),
+    cancelRequested: cancelRequestedFlag,
+    updatedAt: now,
+  };
+}
+
+export function startPullProgress(label = 'Connecting to Immich'): void {
+  const now = new Date().toISOString();
+  cancelRequestedFlag = false;
+  pullProgress = {
+    active: true,
+    phase: 'connecting',
+    percent: 2,
+    label,
+    detail: 'Verifying server reachability and API key...',
+    current: 0,
+    total: 0,
+    cachedCount: 0,
+    ingestedCount: 0,
+    cancelRequested: false,
+    startedAt: now,
+    updatedAt: now,
+    error: null,
+  };
+}
+
+export function finishPullProgress(detail: string, ingestedCount?: number): void {
+  cancelRequestedFlag = false;
+  setPullProgress({
+    active: false,
+    phase: 'done',
+    percent: 100,
+    label: 'Pull & scan complete',
+    detail,
+    ...(typeof ingestedCount === 'number' ? { ingestedCount } : {}),
+    error: null,
+  });
+}
+
+export function failPullProgress(errorMessage: string): void {
+  cancelRequestedFlag = false;
+  setPullProgress({
+    active: false,
+    phase: 'error',
+    label: 'Pull interrupted',
+    detail: errorMessage,
+    error: errorMessage,
+  });
+}
 
 interface StoredImmichConfig {
   baseUrl: string;
@@ -407,27 +504,43 @@ interface ImmichSearchItem {
   fileCreatedAt?: string;
   isArchived?: boolean;
   isTrashed?: boolean;
+  isFavorite?: boolean;
   exifInfo?: {
     city?: string | null;
+    state?: string | null;
     country?: string | null;
     latitude?: number | null;
     longitude?: number | null;
     make?: string | null;
     model?: string | null;
+    lensModel?: string | null;
+    focalLength?: number | null;
+    iso?: number | null;
     exifImageWidth?: number | null;
     exifImageHeight?: number | null;
   };
-  people?: Array<{ id: string }>;
+  people?: Array<{ id: string; name?: string | null }>;
 }
 
 const OCCASION_PROMPTS = [
   'wedding ceremony',
-  'birthday cake',
-  'beach',
-  'hiking',
-  'dinner',
-  'concert',
-  'architecture',
+  'birthday party',
+  'beach ocean',
+  'mountain hiking',
+  'restaurant dinner',
+  'concert stage',
+  'city architecture',
+  'sunset sunrise',
+  'snow skiing',
+  'museum art gallery',
+  'family portrait',
+  'pet dog cat',
+  'sports game',
+  'fireworks festival',
+  'coffee cafe',
+  'temple monument',
+  'garden flowers',
+  'road trip',
 ];
 
 function isWebpBuffer(buf: Buffer): boolean {
@@ -457,215 +570,551 @@ function detectThumbExt(buf: Buffer): 'png' | 'webp' | 'jpg' {
 /**
  * Ingests metadata, thumbnails, and CLIP Smart Search tags from a configured live Immich instance.
  */
-export async function ingestFromLiveImmich(maxPages = 5): Promise<{
+export interface ImmichIngestOptions {
+  /** 0 = pull all photos in Immich (up to 100,000 safety limit) */
+  maxAssets?: number;
+  takenAfter?: string;
+  takenBefore?: string;
+}
+
+/**
+ * Ingests metadata, thumbnails, CIELAB color features, and CLIP Smart Search tags
+ * from a configured live Immich instance with live progress reporting and cancellation.
+ */
+export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): Promise<{
   ingested: number;
   smartTagsMatched: number;
+  cancelled: boolean;
 }> {
-  const status = await checkImmichStatus();
-  if (!status.configured || !status.reachable) {
-    throw new Error(status.lastError || 'Live Immich server is not configured or unreachable.');
-  }
+  startPullProgress('Connecting to Immich');
 
-  // 1. Collect already-albumed asset IDs so curated albums remain untouched
-  const alreadyAlbumedIds = new Set<string>();
-  const albumsRes = await immichFetch('/api/albums');
-  if (albumsRes.ok) {
-    const albums = (await albumsRes.json()) as Array<{ id: string }>;
-    for (let i = 0; i < Math.min(albums.length, 40); i += 6) {
-      const batch = albums.slice(i, i + 6);
-      await Promise.all(
-        batch.map(async (album) => {
-          try {
-            const detailRes = await immichFetch(`/api/albums/${encodeURIComponent(album.id)}`);
-            if (detailRes.ok) {
-              const detail = (await detailRes.json()) as { assets?: Array<{ id: string }> };
-              for (const a of detail.assets || []) {
-                alreadyAlbumedIds.add(a.id);
-              }
-            }
-          } catch {
-            // Non-fatal
-          }
-        })
-      );
+  try {
+    const status = await checkImmichStatus();
+    if (!status.configured || !status.reachable) {
+      throw new Error(status.lastError || 'Live Immich server is not configured or unreachable.');
     }
-  }
 
-  // 2. Paginate POST /api/search/metadata excluding archived & trashed
-  const collected: ImmichSearchItem[] = [];
-  for (let page = 1; page <= maxPages; page++) {
-    const res = await immichFetch('/api/search/metadata', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const settings = getSettings();
+    const rawMax =
+      typeof options.maxAssets === 'number' && Number.isFinite(options.maxAssets)
+        ? Math.max(0, Math.round(options.maxAssets))
+        : settings.maxAssetsPerPull;
+    const effectiveMax = rawMax === 0 ? 100_000 : Math.min(100_000, rawMax);
+    const pageSize = 250;
+    const excludedKeywords = settings.excludedPaths.map((p) => p.toLowerCase()).filter(Boolean);
+
+    // 1. Collect already-albumed asset IDs across all existing Immich albums (5% -> 16%)
+    setPullProgress({
+      active: true,
+      phase: 'albums',
+      percent: 6,
+      label: 'Checking existing albums',
+      detail: 'Listing Immich albums to preserve your curated collections...',
+      current: 0,
+      total: 0,
+    });
+
+    const alreadyAlbumedIds = new Set<string>();
+    const albumsRes = await immichFetch('/api/albums');
+    if (albumsRes.ok) {
+      const albums = (await albumsRes.json()) as Array<{ id: string }>;
+      const totalAlbums = albums.length;
+      let checkedAlbums = 0;
+
+      if (totalAlbums > 0) {
+        setPullProgress({
+          active: true,
+          phase: 'albums',
+          percent: 7,
+          label: 'Checking existing albums',
+          detail: `0 / ${totalAlbums} albums inspected`,
+          current: 0,
+          total: totalAlbums,
+        });
+      }
+
+      for (let i = 0; i < totalAlbums; i += 8) {
+        if (cancelRequestedFlag) break;
+        const batch = albums.slice(i, i + 8);
+        await Promise.all(
+          batch.map(async (album) => {
+            try {
+              const detailRes = await immichFetch(`/api/albums/${encodeURIComponent(album.id)}`);
+              if (detailRes.ok) {
+                const detail = (await detailRes.json()) as { assets?: Array<{ id: string }> };
+                for (const a of detail.assets || []) {
+                  alreadyAlbumedIds.add(a.id);
+                }
+              }
+            } catch {
+              // Non-fatal
+            } finally {
+              checkedAlbums++;
+              const pct = 7 + (checkedAlbums / Math.max(1, totalAlbums)) * 9;
+              setPullProgress({
+                active: true,
+                phase: 'albums',
+                percent: pct,
+                label: 'Checking existing albums',
+                detail: `${checkedAlbums} / ${totalAlbums} albums inspected (${alreadyAlbumedIds.size.toLocaleString()} already-albumed assets)`,
+                current: checkedAlbums,
+                total: totalAlbums,
+              });
+            }
+          })
+        );
+      }
+    }
+
+    // 2. Paginate POST /api/search/metadata excluding archived & trashed (16% -> 34%)
+    const collected: ImmichSearchItem[] = [];
+    const seenIds = new Set<string>();
+    let estimatedTotal = rawMax > 0 ? rawMax : 0;
+
+    setPullProgress({
+      active: true,
+      phase: 'metadata',
+      percent: 16,
+      label: 'Fetching photo metadata',
+      detail: rawMax === 0 ? 'Scanning full Immich library (page 1)...' : `Fetching up to ${rawMax.toLocaleString()} photos (page 1)...`,
+      current: 0,
+      total: estimatedTotal,
+    });
+
+    const maxPages = Math.ceil(effectiveMax / pageSize) + 1;
+    let nextPageNum = 1;
+    for (let step = 0; step < maxPages; step++) {
+      if (cancelRequestedFlag || collected.length >= effectiveMax) break;
+
+      const body: Record<string, unknown> = {
         isArchived: false,
         isTrashed: false,
         type: 'IMAGE',
         withExif: true,
         withPeople: true,
-        page,
-        size: 100,
-      }),
-    });
-    if (!res.ok) {
-      if (page === 1) {
-        const errText = await res.text().catch(() => '');
-        throw new Error(
-          `Immich /api/search/metadata failed (HTTP ${res.status})${errText ? `: ${errText.slice(0, 140)}` : ''}`
-        );
-      }
-      break;
-    }
-    const payload = (await res.json()) as {
-      assets?: { items?: ImmichSearchItem[]; nextPage?: string | null };
-    };
-    const items = payload.assets?.items || [];
-    collected.push(...items);
-    if (!payload.assets?.nextPage || items.length === 0) break;
-  }
+        page: nextPageNum,
+        size: pageSize,
+      };
+      if (options.takenAfter) body.takenAfter = options.takenAfter;
+      if (options.takenBefore) body.takenBefore = options.takenBefore;
 
-  // 3. Query CLIP Smart Search occasion prompts and intersect asset IDs
-  const tagMap = new Map<string, Set<string>>();
-  let smartTagsMatched = 0;
-  await Promise.all(
-    OCCASION_PROMPTS.map(async (prompt) => {
-      try {
-        const smartRes = await immichFetch('/api/search/smart', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query: prompt,
-            type: 'IMAGE',
-            size: 100,
-          }),
-        });
-        if (!smartRes.ok) return;
-        const payload = (await smartRes.json()) as { assets?: { items?: Array<{ id: string }> } };
-        for (const item of payload.assets?.items || []) {
-          if (!tagMap.has(item.id)) tagMap.set(item.id, new Set());
-          tagMap.get(item.id)!.add(prompt);
-          smartTagsMatched++;
-        }
-      } catch {
-        // Non-fatal if ML container is temporarily busy
-      }
-    })
-  );
-
-  // 4. Download thumbnails concurrently (preferring JPEG/PNG for CIELAB decoding) and upsert SQLite
-  fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
-  const db = getDb();
-  const now = new Date().toISOString();
-
-  if (collected.length > 0) {
-    purgeDemoAssets();
-  }
-
-  const thumbFileById = new Map<string, string>();
-  const CONCURRENCY = 6;
-  for (let i = 0; i < collected.length; i += CONCURRENCY) {
-    const batch = collected.slice(i, i + CONCURRENCY);
-    await Promise.all(
-      batch.map(async (item) => {
-        const safeId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const existingExts: Array<'jpg' | 'png' | 'webp'> = ['jpg', 'png', 'webp'];
-        for (const ext of existingExts) {
-          const candidate = `immich_${safeId}.${ext}`;
-          if (fs.existsSync(path.join(THUMBNAIL_DIR, candidate))) {
-            thumbFileById.set(item.id, candidate);
-            return;
-          }
-        }
-
-        try {
-          let thumbRes = await immichFetch(
-            `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
-            { headers: { Accept: 'image/jpeg,image/png,image/webp,*/*' } }
+      const res = await immichFetch('/api/search/metadata', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        if (nextPageNum === 1) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(
+            `Immich /api/search/metadata failed (HTTP ${res.status})${errText ? `: ${errText.slice(0, 140)}` : ''}`
           );
-          if (!thumbRes.ok) return;
-          let buf = Buffer.from(await thumbRes.arrayBuffer());
+        }
+        break;
+      }
 
-          // If Immich returned WebP for thumbnail, try size=preview which Immich often serves as JPEG
-          if (isWebpBuffer(buf)) {
+      const payload = (await res.json()) as {
+        assets?: {
+          total?: number;
+          count?: number;
+          items?: ImmichSearchItem[];
+          nextPage?: string | number | null;
+        };
+      };
+
+      const items = payload.assets?.items || [];
+      if (typeof payload.assets?.total === 'number' && payload.assets.total > 0) {
+        estimatedTotal = rawMax > 0 ? Math.min(rawMax, payload.assets.total) : payload.assets.total;
+      }
+
+      for (const item of items) {
+        if (collected.length >= effectiveMax) break;
+        if (!seenIds.has(item.id)) {
+          seenIds.add(item.id);
+          collected.push(item);
+        }
+      }
+
+      const metaFraction =
+        estimatedTotal > 0
+          ? Math.min(1, collected.length / estimatedTotal)
+          : Math.min(0.95, 1 - Math.exp(-collected.length / 1500));
+      const pct = 16 + metaFraction * 18;
+      setPullProgress({
+        active: true,
+        phase: 'metadata',
+        percent: pct,
+        label: 'Fetching photo metadata',
+        detail:
+          estimatedTotal > 0
+            ? `Page ${nextPageNum} · ${collected.length.toLocaleString()} / ${estimatedTotal.toLocaleString()} photos listed`
+            : `Page ${nextPageNum} · ${collected.length.toLocaleString()} photos listed`,
+        current: collected.length,
+        total: estimatedTotal || collected.length,
+      });
+
+      if (!payload.assets?.nextPage || items.length === 0) break;
+      const parsedNext = Number(payload.assets.nextPage);
+      nextPageNum = Number.isFinite(parsedNext) && parsedNext > nextPageNum ? parsedNext : nextPageNum + 1;
+    }
+
+    // 3. Query CLIP Smart Search occasion prompts (34% -> 42%)
+    const tagMap = new Map<string, Set<string>>();
+    let smartTagsMatched = 0;
+    let promptsDone = 0;
+
+    if (!cancelRequestedFlag && collected.length > 0) {
+      setPullProgress({
+        active: true,
+        phase: 'smart_search',
+        percent: 34,
+        label: 'Querying Immich Smart Search',
+        detail: `0 / ${OCCASION_PROMPTS.length} scene prompts completed`,
+        current: 0,
+        total: OCCASION_PROMPTS.length,
+      });
+
+      const SMART_CONCURRENCY = 6;
+      for (let i = 0; i < OCCASION_PROMPTS.length; i += SMART_CONCURRENCY) {
+        if (cancelRequestedFlag) break;
+        const promptBatch = OCCASION_PROMPTS.slice(i, i + SMART_CONCURRENCY);
+        await Promise.all(
+          promptBatch.map(async (prompt) => {
             try {
-              const previewRes = await immichFetch(
-                `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=preview`,
-                { headers: { Accept: 'image/jpeg,image/png,*/*' } }
-              );
-              if (previewRes.ok) {
-                const previewBuf = Buffer.from(await previewRes.arrayBuffer());
-                if (!isWebpBuffer(previewBuf) && previewBuf.length > 0) {
-                  buf = previewBuf;
-                }
+              const smartRes = await immichFetch('/api/search/smart', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  query: prompt,
+                  type: 'IMAGE',
+                  size: 400,
+                }),
+              });
+              if (!smartRes.ok) return;
+              const payload = (await smartRes.json()) as { assets?: { items?: Array<{ id: string }> } };
+              for (const item of payload.assets?.items || []) {
+                if (!tagMap.has(item.id)) tagMap.set(item.id, new Set());
+                tagMap.get(item.id)!.add(prompt);
+                smartTagsMatched++;
               }
             } catch {
-              // Keep original WebP buffer
+              // Non-fatal if ML container is temporarily busy
+            } finally {
+              promptsDone++;
+              const pct = 34 + (promptsDone / OCCASION_PROMPTS.length) * 8;
+              setPullProgress({
+                active: true,
+                phase: 'smart_search',
+                percent: pct,
+                label: 'Querying Immich ML Smart Search',
+                detail: `${promptsDone} / ${OCCASION_PROMPTS.length} CLIP visual concepts · ${smartTagsMatched.toLocaleString()} matches`,
+                current: promptsDone,
+                total: OCCASION_PROMPTS.length,
+              });
+            }
+          })
+        );
+      }
+    }
+
+    // 4. Download thumbnails + extract CIELAB features incrementally per batch & save to SQLite (42% -> 92%)
+    fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
+    const db = getDb();
+    const now = new Date().toISOString();
+
+    if (collected.length > 0) {
+      purgeDemoAssets();
+    }
+
+    // Preload existing cached assets so incremental re-scans skip already-downloaded & analyzed photos
+    const existingRows = db
+      .prepare('SELECT id, thumbnail_file, lab_l FROM assets')
+      .all() as Array<{ id: string; thumbnail_file: string | null; lab_l: number | null }>;
+    const existingById = new Map(existingRows.map((r) => [r.id, r]));
+
+    const upsert = db.prepare(`
+      INSERT INTO assets (
+        id, source, file_name, original_path, local_date_time,
+        city, state, country, latitude, longitude,
+        exif_make, exif_model, lens_model, focal_length, iso, is_favorite,
+        width, height, is_archived, is_trashed, is_already_albumed,
+        is_screenshot, excluded_reason, people_ids_json, people_names_json, smart_tags_json,
+        thumbnail_file, lab_l, lab_a, lab_b, lab_chroma, lab_hist_json, palette_json, created_at
+      ) VALUES (
+        @id, 'immich', @file_name, @original_path, @local_date_time,
+        @city, @state, @country, @latitude, @longitude,
+        @exif_make, @exif_model, @lens_model, @focal_length, @iso, @is_favorite,
+        @width, @height, @is_archived, @is_trashed, @is_already_albumed,
+        0, NULL, @people_ids_json, @people_names_json, @smart_tags_json,
+        @thumbnail_file, @lab_l, @lab_a, @lab_b, @lab_chroma, @lab_hist_json, @palette_json, @created_at
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        city = excluded.city,
+        state = excluded.state,
+        country = excluded.country,
+        latitude = excluded.latitude,
+        longitude = excluded.longitude,
+        exif_make = excluded.exif_make,
+        exif_model = excluded.exif_model,
+        lens_model = excluded.lens_model,
+        focal_length = excluded.focal_length,
+        iso = excluded.iso,
+        is_favorite = excluded.is_favorite,
+        is_archived = excluded.is_archived,
+        is_trashed = excluded.is_trashed,
+        is_already_albumed = excluded.is_already_albumed,
+        people_ids_json = excluded.people_ids_json,
+        people_names_json = excluded.people_names_json,
+        smart_tags_json = excluded.smart_tags_json,
+        thumbnail_file = COALESCE(excluded.thumbnail_file, assets.thumbnail_file),
+        lab_l = COALESCE(excluded.lab_l, assets.lab_l),
+        lab_a = COALESCE(excluded.lab_a, assets.lab_a),
+        lab_b = COALESCE(excluded.lab_b, assets.lab_b),
+        lab_chroma = COALESCE(excluded.lab_chroma, assets.lab_chroma),
+        lab_hist_json = COALESCE(excluded.lab_hist_json, assets.lab_hist_json),
+        palette_json = COALESCE(excluded.palette_json, assets.palette_json)
+    `);
+
+    const totalAssets = collected.length;
+    let processedCount = 0;
+    let cachedCount = 0;
+    let skippedExcludedCount = 0;
+    let savedToDbCount = 0;
+
+    setPullProgress({
+      active: true,
+      phase: 'thumbnails',
+      percent: 42,
+      label: 'Downloading thumbnails & analyzing color',
+      detail:
+        totalAssets > 0
+          ? `0 / ${totalAssets.toLocaleString()} photos processed`
+          : 'No new photos found',
+      current: 0,
+      total: totalAssets,
+      cachedCount: 0,
+      ingestedCount: 0,
+    });
+
+    const CONCURRENCY = 10;
+    for (let i = 0; i < collected.length; i += CONCURRENCY) {
+      if (cancelRequestedFlag) break;
+      const batch = collected.slice(i, i + CONCURRENCY);
+
+      const batchResults = await Promise.all(
+        batch.map(async (item) => {
+          const isAlbumed = alreadyAlbumedIds.has(item.id);
+          const origPath = item.originalPath || `/immich/${item.originalFileName || item.id}`;
+          const lowerPath = origPath.toLowerCase();
+          const isPathExcluded = excludedKeywords.some((kw) => lowerPath.includes(kw));
+
+          const existing = existingById.get(item.id);
+          const safeId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+          let thumbFile: string | null = existing?.thumbnail_file || null;
+          if (thumbFile && !fs.existsSync(path.join(THUMBNAIL_DIR, thumbFile))) {
+            thumbFile = null;
+          }
+          if (!thumbFile) {
+            for (const ext of ['jpg', 'png', 'webp'] as const) {
+              const candidate = `immich_${safeId}.${ext}`;
+              if (fs.existsSync(path.join(THUMBNAIL_DIR, candidate))) {
+                thumbFile = candidate;
+                break;
+              }
             }
           }
 
-          if (buf.length > 0) {
-            const ext = detectThumbExt(buf);
-            const fileName = `immich_${safeId}.${ext}`;
-            fs.writeFileSync(path.join(THUMBNAIL_DIR, fileName), buf);
-            thumbFileById.set(item.id, fileName);
+          let features: ReturnType<typeof extractColorFeaturesFromPixels> | null = null;
+          const alreadyHasLab = existing?.lab_l !== null && existing?.lab_l !== undefined;
+
+          if (isAlbumed || isPathExcluded) {
+            // Skip downloading thumbnails for assets Stage 1 will exclude anyway
+            skippedExcludedCount++;
+          } else if (thumbFile && alreadyHasLab) {
+            cachedCount++;
+          } else {
+            let imgBuf: Buffer | null = null;
+
+            if (thumbFile) {
+              cachedCount++;
+              try {
+                imgBuf = fs.readFileSync(path.join(THUMBNAIL_DIR, thumbFile));
+              } catch {
+                imgBuf = null;
+              }
+            } else {
+              try {
+                const thumbRes = await immichFetch(
+                  `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
+                  { headers: { Accept: 'image/jpeg,image/png,image/webp,*/*' } }
+                );
+                if (thumbRes.ok) {
+                  let buf = Buffer.from(await thumbRes.arrayBuffer());
+                  if (isWebpBuffer(buf)) {
+                    try {
+                      const previewRes = await immichFetch(
+                        `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=preview`,
+                        { headers: { Accept: 'image/jpeg,image/png,*/*' } }
+                      );
+                      if (previewRes.ok) {
+                        const previewBuf = Buffer.from(await previewRes.arrayBuffer());
+                        if (!isWebpBuffer(previewBuf) && previewBuf.length > 0) {
+                          buf = previewBuf;
+                        }
+                      }
+                    } catch {
+                      // Keep WebP
+                    }
+                  }
+                  if (buf.length > 0) {
+                    const ext = detectThumbExt(buf);
+                    thumbFile = `immich_${safeId}.${ext}`;
+                    fs.writeFileSync(path.join(THUMBNAIL_DIR, thumbFile), buf);
+                    imgBuf = buf;
+                  }
+                }
+              } catch {
+                // Non-fatal thumbnail error
+              }
+            }
+
+            if (imgBuf && !alreadyHasLab && thumbFile && !thumbFile.endsWith('.webp')) {
+              try {
+                const mime = thumbFile.endsWith('.png') ? 'image/png' : 'image/jpeg';
+                const decoded = decodeImageBufferToRgba(imgBuf, mime);
+                features = extractColorFeaturesFromPixels(
+                  decoded.data,
+                  decoded.width,
+                  decoded.height
+                );
+              } catch {
+                // Non-fatal decode error; pipeline has neutral fallback
+              }
+            }
           }
-        } catch {
-          // Non-fatal thumbnail error
+
+          return { item, origPath, isAlbumed, thumbFile, features };
+        })
+      );
+
+      // Persist this batch to SQLite immediately so progress survives cancellation
+      db.transaction(() => {
+        for (const row of batchResults) {
+          const exif = row.item.exifInfo || {};
+          const rawLat = typeof exif.latitude === 'number' ? exif.latitude : null;
+          const rawLng = typeof exif.longitude === 'number' ? exif.longitude : null;
+          const hasValidCoords =
+            rawLat !== null &&
+            rawLng !== null &&
+            Number.isFinite(rawLat) &&
+            Number.isFinite(rawLng) &&
+            rawLat >= -90 &&
+            rawLat <= 90 &&
+            rawLng >= -180 &&
+            rawLng <= 180 &&
+            !(Math.abs(rawLat) < 0.001 && Math.abs(rawLng) < 0.001);
+
+          const rawCity = typeof exif.city === 'string' ? exif.city.trim() : '';
+          const rawState = typeof exif.state === 'string' ? exif.state.trim() : '';
+          const rawCountry = typeof exif.country === 'string' ? exif.country.trim() : '';
+          const isCyrillicCountry =
+            /russia|belarus|ukraine|kazakhstan|kyrgyzstan|bulgaria|serbia|macedonia|mongolia|tajikistan|uzbekistan|montenegro|bosnia/i.test(
+              rawCountry
+            );
+          const hasCyrillic = (s: string) => /[\u0400-\u04FF]/.test(s);
+          let resolvedCity: string | null = rawCity || null;
+          if (resolvedCity && !isCyrillicCountry && hasCyrillic(resolvedCity)) {
+            resolvedCity =
+              rawState && !hasCyrillic(rawState)
+                ? rawState
+                : rawCountry && !hasCyrillic(rawCountry)
+                  ? rawCountry
+                  : null;
+          }
+
+          const peopleList = row.item.people || [];
+          const peopleIds = peopleList.map((p) => p.id).filter(Boolean);
+          const peopleNames = peopleList
+            .map((p) => (typeof p.name === 'string' ? p.name.trim() : ''))
+            .filter(Boolean);
+
+          upsert.run({
+            id: row.item.id,
+            file_name: row.item.originalFileName || `${row.item.id}.jpg`,
+            original_path: row.origPath,
+            local_date_time: row.item.localDateTime || row.item.fileCreatedAt || now,
+            city: resolvedCity,
+            state: rawState && !(!isCyrillicCountry && hasCyrillic(rawState)) ? rawState : null,
+            country: rawCountry || null,
+            latitude: hasValidCoords ? rawLat : null,
+            longitude: hasValidCoords ? rawLng : null,
+            exif_make: exif.make || null,
+            exif_model: exif.model || null,
+            lens_model: typeof exif.lensModel === 'string' && exif.lensModel.trim() ? exif.lensModel.trim() : null,
+            focal_length: typeof exif.focalLength === 'number' && Number.isFinite(exif.focalLength) ? exif.focalLength : null,
+            iso: typeof exif.iso === 'number' && Number.isFinite(exif.iso) ? Math.round(exif.iso) : null,
+            is_favorite: row.item.isFavorite ? 1 : 0,
+            width: exif.exifImageWidth || 1600,
+            height: exif.exifImageHeight || 1200,
+            is_archived: row.item.isArchived ? 1 : 0,
+            is_trashed: row.item.isTrashed ? 1 : 0,
+            is_already_albumed: row.isAlbumed ? 1 : 0,
+            people_ids_json: JSON.stringify(peopleIds),
+            people_names_json: JSON.stringify(peopleNames),
+            smart_tags_json: JSON.stringify(Array.from(tagMap.get(row.item.id) || [])),
+            thumbnail_file: row.thumbFile,
+            lab_l: row.features ? row.features.avgLab.l : null,
+            lab_a: row.features ? row.features.avgLab.a : null,
+            lab_b: row.features ? row.features.avgLab.b : null,
+            lab_chroma: row.features ? row.features.avgLab.chroma : null,
+            lab_hist_json: row.features ? JSON.stringify(row.features.histogram) : null,
+            palette_json: row.features ? JSON.stringify(row.features.palette) : null,
+            created_at: now,
+          });
+          savedToDbCount++;
         }
-      })
-    );
-  }
+      })();
 
-  const upsert = db.prepare(`
-    INSERT INTO assets (
-      id, source, file_name, original_path, local_date_time,
-      city, country, latitude, longitude, exif_make, exif_model,
-      width, height, is_archived, is_trashed, is_already_albumed,
-      is_screenshot, excluded_reason, people_ids_json, smart_tags_json,
-      thumbnail_file, created_at
-    ) VALUES (
-      @id, 'immich', @file_name, @original_path, @local_date_time,
-      @city, @country, @latitude, @longitude, @exif_make, @exif_model,
-      @width, @height, @is_archived, @is_trashed, @is_already_albumed,
-      0, NULL, @people_ids_json, @smart_tags_json,
-      @thumbnail_file, @created_at
-    )
-    ON CONFLICT(id) DO UPDATE SET
-      is_archived = excluded.is_archived,
-      is_trashed = excluded.is_trashed,
-      is_already_albumed = excluded.is_already_albumed,
-      smart_tags_json = excluded.smart_tags_json,
-      thumbnail_file = COALESCE(excluded.thumbnail_file, assets.thumbnail_file)
-  `);
-
-  db.transaction(() => {
-    for (const item of collected) {
-      const exif = item.exifInfo || {};
-      upsert.run({
-        id: item.id,
-        file_name: item.originalFileName || `${item.id}.jpg`,
-        original_path: item.originalPath || `/immich/${item.originalFileName || item.id}`,
-        local_date_time: item.localDateTime || item.fileCreatedAt || now,
-        city: exif.city || null,
-        country: exif.country || null,
-        latitude: typeof exif.latitude === 'number' ? exif.latitude : null,
-        longitude: typeof exif.longitude === 'number' ? exif.longitude : null,
-        exif_make: exif.make || null,
-        exif_model: exif.model || null,
-        width: exif.exifImageWidth || 1600,
-        height: exif.exifImageHeight || 1200,
-        is_archived: item.isArchived ? 1 : 0,
-        is_trashed: item.isTrashed ? 1 : 0,
-        is_already_albumed: alreadyAlbumedIds.has(item.id) ? 1 : 0,
-        people_ids_json: JSON.stringify((item.people || []).map((p) => p.id)),
-        smart_tags_json: JSON.stringify(Array.from(tagMap.get(item.id) || [])),
-        thumbnail_file: thumbFileById.get(item.id) || null,
-        created_at: now,
+      processedCount += batchResults.length;
+      const pct = 42 + (processedCount / Math.max(1, totalAssets)) * 50;
+      const notes: string[] = [];
+      if (cachedCount > 0) notes.push(`${cachedCount.toLocaleString()} cached`);
+      if (skippedExcludedCount > 0) notes.push(`${skippedExcludedCount.toLocaleString()} skipped`);
+      setPullProgress({
+        active: true,
+        phase: 'thumbnails',
+        percent: pct,
+        label: 'Downloading thumbnails & analyzing color',
+        detail: `${processedCount.toLocaleString()} / ${totalAssets.toLocaleString()} photos${notes.length > 0 ? ` (${notes.join(' · ')})` : ''}`,
+        current: processedCount,
+        total: totalAssets,
+        cachedCount,
+        ingestedCount: savedToDbCount,
       });
     }
-  })();
 
-  return { ingested: collected.length, smartTagsMatched };
+    setPullProgress({
+      active: true,
+      phase: 'clustering',
+      percent: 94,
+      label: 'Building event & color-tone albums',
+      detail: `Clustering ${savedToDbCount.toLocaleString()} indexed photos into album proposals...`,
+      current: savedToDbCount,
+      total: totalAssets,
+      cachedCount,
+      ingestedCount: savedToDbCount,
+    });
+
+    return {
+      ingested: savedToDbCount,
+      smartTagsMatched,
+      cancelled: cancelRequestedFlag,
+    };
+  } catch (err) {
+    failPullProgress(err instanceof Error ? err.message : 'Immich ingestion failed');
+    throw err;
+  }
 }
 
 /**

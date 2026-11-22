@@ -21,11 +21,18 @@ import {
 import {
   checkImmichStatus,
   clearSavedImmichConnection,
+  failPullProgress,
+  finishPullProgress,
   getActiveImmichKey,
+  getPullProgress,
+  type ImmichIngestOptions,
   ingestFromLiveImmich,
+  isPullRunning,
   normalizeApiKey,
   probeImmichConnection,
+  requestCancelPull,
   saveImmichConnection,
+  startPullProgress,
   validateImmichUrl,
 } from './src/server/immichClient.ts';
 import {
@@ -114,12 +121,69 @@ async function startServer() {
     res.json({ status });
   });
 
-  // Pull assets from a configured live Immich server & run clustering
-  app.post('/api/immich/ingest', async (_req, res) => {
+  const launchLiveImmichPullJob = (options: ImmichIngestOptions = {}) => {
+    if (isPullRunning()) {
+      return getPullProgress();
+    }
+    startPullProgress('Connecting to Immich');
+    void (async () => {
+      try {
+        const result = await ingestFromLiveImmich(options);
+        const run = runFullPipeline();
+        const suffix = result.cancelled
+          ? ' (stopped early — clustered photos pulled so far)'
+          : '';
+        finishPullProgress(
+          `Indexed ${result.ingested.toLocaleString()} photos into ${run.clusters.length} album proposals in ${run.summary.durationMs} ms${suffix}.`,
+          result.ingested
+        );
+      } catch (err) {
+        failPullProgress(err instanceof Error ? err.message : 'Immich ingestion failed');
+      }
+    })();
+    return getPullProgress();
+  };
+
+  // Live pull & scan progress polling endpoint
+  app.get('/api/pipeline/progress', (_req, res) => {
+    res.json({ progress: getPullProgress() });
+  });
+
+  // Stop an active Immich pull early and cluster everything fetched so far
+  app.post('/api/pipeline/cancel', (_req, res) => {
+    res.json({ progress: requestCancelPull() });
+  });
+
+  // Pull assets from a configured live Immich server & run clustering (async to support huge libraries)
+  app.post('/api/immich/ingest', async (req, res) => {
     try {
-      const result = await ingestFromLiveImmich(5);
-      const run = runFullPipeline();
-      res.json({ ...result, ...run });
+      const status = await checkImmichStatus();
+      if (!status.configured || !status.reachable) {
+        res.status(400).json({
+          error: status.lastError || 'Live Immich server is not configured or unreachable.',
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as {
+        maxAssets?: number;
+        takenAfter?: string;
+        takenBefore?: string;
+      };
+      const opts: ImmichIngestOptions = {};
+      if (typeof body.maxAssets === 'number' && Number.isFinite(body.maxAssets)) {
+        opts.maxAssets = Math.max(0, Math.round(body.maxAssets));
+        saveSettings({ maxAssetsPerPull: opts.maxAssets });
+      }
+      if (typeof body.takenAfter === 'string' && body.takenAfter.trim()) {
+        opts.takenAfter = body.takenAfter.trim();
+      }
+      if (typeof body.takenBefore === 'string' && body.takenBefore.trim()) {
+        opts.takenBefore = body.takenBefore.trim();
+      }
+
+      const progress = launchLiveImmichPullJob(opts);
+      res.status(202).json({ started: true, progress });
     } catch (err) {
       res.status(400).json({
         error: err instanceof Error ? err.message : 'Immich ingestion failed',
@@ -277,14 +341,12 @@ async function startServer() {
     try {
       const immichStatus = await checkImmichStatus();
       if (immichStatus.configured && immichStatus.reachable) {
-        const ingest = await ingestFromLiveImmich(5);
-        const run = runFullPipeline();
-        res.json({
-          ...run,
-          assets: getAllAssets(),
-          immichStatus,
-          ingested: ingest.ingested,
+        const progress = launchLiveImmichPullJob();
+        res.status(202).json({
+          started: true,
           mode: 'live_immich',
+          immichStatus,
+          progress,
         });
         return;
       }
@@ -415,6 +477,75 @@ async function startServer() {
     res.json({ settings });
   });
 
+  // Optional on-demand English city lookup for setting a manual Home Base
+  app.get('/api/geocode/search', async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2 || q.length > 100) {
+      res.status(400).json({ error: 'Enter at least 2 characters to search for a city.' });
+      return;
+    }
+
+    try {
+      const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=6&q=${encodeURIComponent(q)}`;
+      const response = await fetch(url, {
+        headers: {
+          'Accept-Language': 'en',
+          'User-Agent': 'ChromaCluster-Immich-Sidecar/1.0',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!response.ok) {
+        res.status(502).json({ error: `Geocoder returned HTTP ${response.status}` });
+        return;
+      }
+      const rows = (await response.json()) as Array<{
+        display_name?: string;
+        name?: string;
+        lat?: string;
+        lon?: string;
+        address?: {
+          city?: string;
+          town?: string;
+          village?: string;
+          municipality?: string;
+          state?: string;
+          country?: string;
+        };
+      }>;
+
+      const results = rows
+        .map((r) => {
+          const lat = Number(r.lat);
+          const lng = Number(r.lon);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+          const city =
+            r.address?.city ||
+            r.address?.town ||
+            r.address?.village ||
+            r.address?.municipality ||
+            r.name ||
+            (r.display_name || '').split(',')[0]?.trim() ||
+            q;
+          const country = r.address?.country || null;
+          return {
+            city,
+            country,
+            displayName: r.display_name || (country ? `${city}, ${country}` : city),
+            lat: Number(lat.toFixed(4)),
+            lng: Number(lng.toFixed(4)),
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+
+      res.json({ results });
+    } catch {
+      res.status(503).json({
+        error:
+          'City lookup unavailable offline. Enter your City Name, Latitude, and Longitude directly below.',
+      });
+    }
+  });
+
   app.put('/api/settings', (req, res) => {
     try {
       const { settings: partial, rerun } = req.body as {
@@ -425,7 +556,13 @@ async function startServer() {
       const pipeline = rerun ? runFullPipeline() : null;
       res.json({
         settings: saved,
-        ...(pipeline ? { summary: pipeline.summary, clusters: pipeline.clusters } : {}),
+        ...(pipeline
+          ? {
+              summary: pipeline.summary,
+              clusters: pipeline.clusters,
+              assets: getAllAssets(),
+            }
+          : {}),
       });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid settings' });

@@ -574,19 +574,63 @@ export function ReviewQueueView({
               </button>
             </div>
 
-            <div className="border-b border-zinc-200 dark:border-white/[0.08] px-6 py-4 bg-zinc-50/80 dark:bg-[#11141B]">
-              <div className="mb-2 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
-                <span>Cluster 5-color CIELAB palette</span>
-                <span className="font-mono tabular-nums">
-                  {inspectedCluster.assetIds.length} frames
-                </span>
+            <div className="border-b border-zinc-200 dark:border-white/[0.08] px-6 py-4 bg-zinc-50/80 dark:bg-[#11141B] space-y-3">
+              <div>
+                <div className="mb-2 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+                  <span>Cluster 5-color CIELAB palette</span>
+                  <span className="font-mono tabular-nums">
+                    {inspectedCluster.assetIds.length} frames
+                  </span>
+                </div>
+                <PaletteBar
+                  swatches={inspectedCluster.palette}
+                  heightClass="h-4"
+                  interactive={false}
+                  showLegend
+                />
               </div>
-              <PaletteBar
-                swatches={inspectedCluster.palette}
-                heightClass="h-4"
-                interactive={false}
-                showLegend
-              />
+
+              {inspectedCluster.signalBreakdown && (
+                <div className="pt-2.5 border-t border-zinc-200/70 dark:border-white/[0.06] text-[11px] text-zinc-500 dark:text-zinc-400 space-y-1">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      <strong className="font-medium text-zinc-700 dark:text-zinc-300">
+                        Active signals:{' '}
+                      </strong>
+                      {[
+                        inspectedCluster.signalBreakdown.gps && 'GPS',
+                        inspectedCluster.signalBreakdown.immichMl && 'Immich ML',
+                        inspectedCluster.signalBreakdown.chroma && 'CIELAB Chroma',
+                        inspectedCluster.signalBreakdown.faces && 'Faces',
+                        inspectedCluster.signalBreakdown.exif && 'EXIF',
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </span>
+                    {inspectedCluster.signalBreakdown.favoriteCount > 0 && (
+                      <span className="font-mono tabular-nums text-zinc-600 dark:text-zinc-300">
+                        {inspectedCluster.signalBreakdown.favoriteCount} favorites
+                      </span>
+                    )}
+                  </div>
+                  {inspectedCluster.signalBreakdown.topTags.length > 0 && (
+                    <div>
+                      <strong className="font-medium text-zinc-700 dark:text-zinc-300">
+                        Immich ML concepts:{' '}
+                      </strong>
+                      {inspectedCluster.signalBreakdown.topTags.join(', ')}
+                    </div>
+                  )}
+                  {inspectedCluster.signalBreakdown.namedPeople.length > 0 && (
+                    <div>
+                      <strong className="font-medium text-zinc-700 dark:text-zinc-300">
+                        Recognized people:{' '}
+                      </strong>
+                      {inspectedCluster.signalBreakdown.namedPeople.join(', ')}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto px-6 py-4">

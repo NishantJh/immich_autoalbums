@@ -35,17 +35,26 @@ export function EmdChart({
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
 
-  const maxEmd = Math.max(0.75, emdThreshold + 0.15, ...points.map((p) => p.emdScore));
+  const scoreOf = (p: EmdTimelinePoint) => p.compositeScore ?? p.emdScore;
+  const maxEmd = Math.max(
+    0.75,
+    emdThreshold + 0.15,
+    ...points.map((p) => Math.max(scoreOf(p), p.emdScore))
+  );
   const xAt = (i: number) =>
     points.length === 1 ? padL + plotW / 2 : padL + (i / (points.length - 1)) * plotW;
   const yAtEmd = (v: number) => padT + plotH - (Math.min(maxEmd, Math.max(0, v)) / maxEmd) * plotH;
   const yAtLightness = (l: number) => padT + plotH - (Math.min(100, Math.max(0, l)) / 100) * plotH;
 
-  const emdPath = points
-    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${xAt(i).toFixed(1)} ${yAtEmd(p.emdScore).toFixed(1)}`)
+  const compositePath = points
+    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${xAt(i).toFixed(1)} ${yAtEmd(scoreOf(p)).toFixed(1)}`)
     .join(' ');
 
-  const emdArea = `${emdPath} L ${xAt(points.length - 1).toFixed(1)} ${(padT + plotH).toFixed(1)} L ${xAt(0).toFixed(1)} ${(padT + plotH).toFixed(1)} Z`;
+  const compositeArea = `${compositePath} L ${xAt(points.length - 1).toFixed(1)} ${(padT + plotH).toFixed(1)} L ${xAt(0).toFixed(1)} ${(padT + plotH).toFixed(1)} Z`;
+
+  const chromaPath = points
+    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${xAt(i).toFixed(1)} ${yAtEmd(p.emdScore).toFixed(1)}`)
+    .join(' ');
 
   const lightnessPath = points
     .map((p, i) => `${i === 0 ? 'M' : 'L'} ${xAt(i).toFixed(1)} ${yAtLightness(p.labL).toFixed(1)}`)
@@ -56,21 +65,22 @@ export function EmdChart({
     hoveredIdx !== null
       ? points[hoveredIdx]
       : points.find((p) => p.isSplitBoundary) || points[0];
-  const activeIdx = hoveredIdx !== null ? hoveredIdx : points.findIndex((p) => p.index === activePoint.index);
+  const activeIdx =
+    hoveredIdx !== null ? hoveredIdx : points.findIndex((p) => p.index === activePoint.index);
 
   return (
     <div className="w-full">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-            Sliding-Window CIELAB Earth Mover&apos;s Distance — {eventName}
+            Multi-Signal Scene Boundary Analysis — {eventName}
           </h3>
           <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
-            5-photo rolling histogram shift · Split requires EMD &ge;{' '}
+            5-photo rolling fusion (CIELAB Chroma · Immich ML · GPS · Faces · EXIF) · Split at &ge;{' '}
             <span className="font-mono tabular-nums text-zinc-700 dark:text-zinc-300">
               {emdThreshold.toFixed(2)}
             </span>{' '}
-            and gap &ge;{' '}
+            &amp; gap &ge;{' '}
             <span className="font-mono tabular-nums text-zinc-700 dark:text-zinc-300">
               {sceneSplitGapMins} min
             </span>
@@ -80,11 +90,15 @@ export function EmdChart({
         <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-600 dark:text-zinc-400">
           <span className="flex items-center gap-1.5">
             <span className="inline-block h-2 w-3.5 rounded-[2px] bg-indigo-600 dark:bg-indigo-400" />
-            EMD shift
+            Fused shift
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block h-0.5 w-3.5 bg-teal-500" />
+            Chroma EMD
           </span>
           <span className="flex items-center gap-1.5">
             <span className="inline-block h-0.5 w-3.5 bg-amber-500" />
-            Mean L* lightness
+            Mean L*
           </span>
           <span className="flex items-center gap-1.5">
             <span className="inline-block h-3 w-0.5 bg-rose-500" />
@@ -98,7 +112,7 @@ export function EmdChart({
           viewBox={`0 0 ${width} ${height}`}
           className="w-full min-w-[560px] h-auto select-none"
           role="img"
-          aria-label={`CIELAB EMD chart for ${eventName}`}
+          aria-label={`Multi-signal scene boundary chart for ${eventName}`}
         >
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
@@ -164,10 +178,17 @@ export function EmdChart({
             Threshold {emdThreshold.toFixed(2)}
           </text>
 
-          {/* EMD gradient area & curve */}
-          <path d={emdArea} fill={`url(#${gradientId})`} />
+          {/* Fused gradient area & curve */}
+          <path d={compositeArea} fill={`url(#${gradientId})`} />
           <path
-            d={emdPath}
+            d={chromaPath}
+            fill="none"
+            className="stroke-teal-500/70 dark:stroke-teal-400/70"
+            strokeWidth={1.4}
+            strokeDasharray="3 2"
+          />
+          <path
+            d={compositePath}
             fill="none"
             className="stroke-indigo-600 dark:stroke-indigo-400"
             strokeWidth={2}
@@ -179,15 +200,15 @@ export function EmdChart({
           <path
             d={lightnessPath}
             fill="none"
-            className="stroke-amber-500/80 dark:stroke-amber-400/80"
-            strokeWidth={1.5}
+            className="stroke-amber-500/75 dark:stroke-amber-400/75"
+            strokeWidth={1.4}
             strokeDasharray="3 3"
           />
 
           {/* Split boundaries and interactive points */}
           {points.map((pt, idx) => {
             const cx = xAt(idx);
-            const cy = yAtEmd(pt.emdScore);
+            const cy = yAtEmd(scoreOf(pt));
             const isActive = activePoint?.index === pt.index;
             return (
               <g key={pt.assetId}>
@@ -203,7 +224,7 @@ export function EmdChart({
                       strokeDasharray="3 3"
                     />
                     <text
-                      x={Math.min(cx + 5, width - padR - 72)}
+                      x={Math.min(cx + 5, width - padR - 92)}
                       y={padT + 11}
                       className="fill-rose-600 dark:fill-rose-400 font-mono text-[10px] font-medium"
                     >
@@ -282,13 +303,19 @@ export function EmdChart({
                   timeZone: 'UTC',
                 })}{' '}
                 UTC · Chapter {activePoint.chapterIndex + 1}
+                {activePoint.splitSignals && activePoint.splitSignals.length > 0 && (
+                  <span className="text-rose-600 dark:text-rose-400">
+                    {' '}
+                    · Split by {activePoint.splitSignals.join(' + ')}
+                  </span>
+                )}
               </div>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-5 font-mono tabular-nums text-zinc-700 dark:text-zinc-300">
+          <div className="flex flex-wrap items-center gap-4 font-mono tabular-nums text-zinc-700 dark:text-zinc-300">
             <div>
-              <span className="text-zinc-400 dark:text-zinc-500 mr-1.5">EMD</span>
+              <span className="text-zinc-400 dark:text-zinc-500 mr-1">Fused</span>
               <span
                 className={
                   activePoint.isSplitBoundary
@@ -296,24 +323,40 @@ export function EmdChart({
                     : 'font-semibold text-zinc-900 dark:text-zinc-100'
                 }
               >
-                {activePoint.emdScore.toFixed(3)}
+                {scoreOf(activePoint).toFixed(2)}
               </span>
             </div>
             <div>
-              <span className="text-zinc-400 dark:text-zinc-500 mr-1.5">Gap</span>
-              <span>{activePoint.gapMinutes.toFixed(0)} min</span>
+              <span className="text-zinc-400 dark:text-zinc-500 mr-1">Chroma</span>
+              <span>{activePoint.emdScore.toFixed(2)}</span>
             </div>
+            {typeof activePoint.semanticShift === 'number' && activePoint.semanticShift > 0 && (
+              <div>
+                <span className="text-zinc-400 dark:text-zinc-500 mr-1">ML</span>
+                <span>{activePoint.semanticShift.toFixed(2)}</span>
+              </div>
+            )}
+            {typeof activePoint.gpsShift === 'number' && activePoint.gpsShift > 0 && (
+              <div>
+                <span className="text-zinc-400 dark:text-zinc-500 mr-1">GPS</span>
+                <span>{activePoint.gpsShift.toFixed(2)}</span>
+              </div>
+            )}
+            {typeof activePoint.peopleShift === 'number' && activePoint.peopleShift > 0 && (
+              <div>
+                <span className="text-zinc-400 dark:text-zinc-500 mr-1">Faces</span>
+                <span>{activePoint.peopleShift.toFixed(2)}</span>
+              </div>
+            )}
+            {typeof activePoint.exifShift === 'number' && activePoint.exifShift > 0 && (
+              <div>
+                <span className="text-zinc-400 dark:text-zinc-500 mr-1">EXIF</span>
+                <span>{activePoint.exifShift.toFixed(2)}</span>
+              </div>
+            )}
             <div>
-              <span className="text-zinc-400 dark:text-zinc-500 mr-1.5">L*</span>
-              <span>{activePoint.labL.toFixed(1)}</span>
-            </div>
-            <div>
-              <span className="text-zinc-400 dark:text-zinc-500 mr-1.5">b*</span>
-              <span>
-                {activePoint.labB >= 0
-                  ? `+${activePoint.labB.toFixed(1)} warm`
-                  : `${activePoint.labB.toFixed(1)} cool`}
-              </span>
+              <span className="text-zinc-400 dark:text-zinc-500 mr-1">Gap</span>
+              <span>{activePoint.gapMinutes.toFixed(0)}m</span>
             </div>
           </div>
         </div>

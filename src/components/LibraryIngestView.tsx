@@ -17,13 +17,20 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { AssetRecord, ImmichStatus } from '../shared/types.ts';
+import type {
+  AssetRecord,
+  ImmichStatus,
+  OrganizerSettings,
+  PullProgressState,
+} from '../shared/types.ts';
 import { PaletteBar } from './PaletteBar.tsx';
 import { ThumbnailImage } from './ThumbnailImage.tsx';
 
 interface LibraryIngestViewProps {
   assets: AssetRecord[];
   immichStatus: ImmichStatus;
+  settings: OrganizerSettings;
+  pullProgress: PullProgressState | null;
   busyAction: string | null;
   onUploadPhotos: (
     files: Array<{
@@ -49,9 +56,21 @@ interface LibraryIngestViewProps {
     lastError: string | null;
   }>;
   onDisconnectImmich: () => Promise<void>;
-  onIngestImmich: () => Promise<void>;
+  onIngestImmich: (options?: {
+    maxAssets?: number;
+    takenAfter?: string;
+    takenBefore?: string;
+  }) => Promise<void>;
   onClearLocalCache: () => Promise<void>;
 }
+
+const PULL_SCOPE_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 0, label: 'All Photos (Full Library)' },
+  { value: 500, label: 'Latest 500 Photos' },
+  { value: 2000, label: 'Latest 2,000 Photos' },
+  { value: 5000, label: 'Latest 5,000 Photos' },
+  { value: 10000, label: 'Latest 10,000 Photos' },
+];
 
 async function fileToThumbnail(file: File): Promise<{
   dataUrl: string;
@@ -84,6 +103,8 @@ async function fileToThumbnail(file: File): Promise<{
 export function LibraryIngestView({
   assets,
   immichStatus,
+  settings,
+  pullProgress,
   busyAction,
   onUploadPhotos,
   onSaveImmichConfig,
@@ -96,7 +117,10 @@ export function LibraryIngestView({
   const [filter, setFilter] = useState<'all' | 'eligible' | 'excluded'>('all');
   const [assetQuery, setAssetQuery] = useState('');
   const [uploadCity, setUploadCity] = useState('');
-  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<{
+    text: string;
+    percent: number;
+  } | null>(null);
   const [dragActive, setDragActive] = useState(false);
 
   const [immichUrl, setImmichUrl] = useState(immichStatus.baseUrl || '');
@@ -108,11 +132,19 @@ export function LibraryIngestView({
     message: string;
   } | null>(null);
 
+  const [maxAssets, setMaxAssets] = useState<number>(settings.maxAssetsPerPull ?? 0);
+  const [takenAfter, setTakenAfter] = useState('');
+  const [takenBefore, setTakenBefore] = useState('');
+
   useEffect(() => {
     if (immichStatus.baseUrl) {
       setImmichUrl(immichStatus.baseUrl);
     }
   }, [immichStatus.baseUrl]);
+
+  useEffect(() => {
+    setMaxAssets(settings.maxAssetsPerPull ?? 0);
+  }, [settings.maxAssetsPerPull]);
 
   const filtered = useMemo(() => {
     const q = assetQuery.trim().toLowerCase();
@@ -133,13 +165,17 @@ export function LibraryIngestView({
     if (!fileList || fileList.length === 0) return;
     const files = Array.from(fileList)
       .filter((f) => f.type.startsWith('image/'))
-      .slice(0, 40);
+      .slice(0, 60);
     if (files.length === 0) return;
 
-    setUploadProgress(`Reading EXIF & generating thumbnails for ${files.length} photos...`);
+    setUploadStatus({
+      text: `Reading EXIF & resizing 0 / ${files.length} photos...`,
+      percent: 4,
+    });
     try {
       const payload = [];
-      for (const file of files) {
+      for (let idx = 0; idx < files.length; idx++) {
+        const file = files[idx];
         let parsedExif: Record<string, unknown> | null = null;
         try {
           parsedExif = (await exifr.parse(file, {
@@ -173,15 +209,26 @@ export function LibraryIngestView({
           smartTags: [],
           thumbnailDataUrl: thumb.dataUrl,
         });
+
+        const pct = Math.round(((idx + 1) / files.length) * 75);
+        setUploadStatus({
+          text: `Prepared ${idx + 1} / ${files.length} photos...`,
+          percent: pct,
+        });
       }
 
-      setUploadProgress('Extracting CIELAB palettes & running 4-stage clustering...');
+      setUploadStatus({
+        text: `Extracting CIELAB palettes & clustering ${payload.length} photos...`,
+        percent: 88,
+      });
       await onUploadPhotos(payload);
-      setUploadProgress(null);
+      setUploadStatus(null);
     } catch {
-      setUploadProgress(null);
+      setUploadStatus(null);
     }
   };
+
+  const isPulling = Boolean(pullProgress?.active) || busyAction === 'immich-ingest';
 
   const activeDiagnostic = testResult
     ? { ok: testResult.reachable, text: testResult.message }
@@ -293,6 +340,50 @@ export function LibraryIngestView({
                   </button>
                 </div>
               </label>
+
+              {/* Pull Scope & Optional Date Window */}
+              <div className="grid grid-cols-1 gap-3 pt-1 sm:grid-cols-3">
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                    Pull Scope
+                  </span>
+                  <select
+                    value={maxAssets}
+                    onChange={(e) => setMaxAssets(Number(e.target.value))}
+                    className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.09] bg-zinc-50/70 dark:bg-[#0A0C10] px-2.5 py-2 text-xs text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+                  >
+                    {PULL_SCOPE_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                    From Date (opt.)
+                  </span>
+                  <input
+                    type="date"
+                    value={takenAfter}
+                    onChange={(e) => setTakenAfter(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.09] bg-zinc-50/70 dark:bg-[#0A0C10] px-2.5 py-2 text-xs font-mono text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+                  />
+                </label>
+
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                    To Date (opt.)
+                  </span>
+                  <input
+                    type="date"
+                    value={takenBefore}
+                    onChange={(e) => setTakenBefore(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.09] bg-zinc-50/70 dark:bg-[#0A0C10] px-2.5 py-2 text-xs font-mono text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+                  />
+                </label>
+              </div>
             </div>
 
             {activeDiagnostic && (
@@ -318,13 +409,13 @@ export function LibraryIngestView({
                 asset.read, asset.view, album.read, album.create, albumAsset.create
               </code>{' '}
               (or <strong className="font-medium text-zinc-700 dark:text-zinc-300">All</strong>).
-              Saving credentials only verifies reachability—nothing is written to Immich until you approve an album sync.
+              Previously pulled thumbnails and CIELAB palettes stay cached in SQLite so re-scans only download new photos.
               {immichStatus.source === 'saved' && (
                 <>
                   {' '}
-                  App-saved credentials override container environment variables; click{' '}
+                  Click{' '}
                   <strong className="font-medium text-zinc-700 dark:text-zinc-300">Disconnect</strong>{' '}
-                  to fall back to container variables.
+                  to fall back to container environment variables.
                 </>
               )}
             </p>
@@ -334,7 +425,7 @@ export function LibraryIngestView({
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                disabled={!immichUrl.trim() || testing || busyAction !== null}
+                disabled={!immichUrl.trim() || testing || busyAction !== null || isPulling}
                 onClick={async () => {
                   setTestResult(null);
                   setTesting(true);
@@ -370,7 +461,8 @@ export function LibraryIngestView({
                 disabled={
                   !immichUrl.trim() ||
                   (!immichApiKey.trim() && !immichStatus.configured) ||
-                  busyAction !== null
+                  busyAction !== null ||
+                  isPulling
                 }
                 onClick={async () => {
                   setTestResult(null);
@@ -389,30 +481,38 @@ export function LibraryIngestView({
 
               <button
                 type="button"
-                disabled={!immichStatus.reachable || busyAction !== null}
-                onClick={onIngestImmich}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-45 whitespace-nowrap shrink-0 transition-colors"
+                disabled={!immichStatus.reachable || busyAction !== null || isPulling}
+                onClick={() =>
+                  onIngestImmich({
+                    maxAssets,
+                    takenAfter: takenAfter ? `${takenAfter}T00:00:00.000Z` : undefined,
+                    takenBefore: takenBefore ? `${takenBefore}T23:59:59.999Z` : undefined,
+                  })
+                }
+                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-45 whitespace-nowrap shrink-0 transition-colors tabular-nums"
               >
-                {busyAction === 'immich-ingest' ? (
+                {isPulling ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
                   <CloudDownload className="h-3.5 w-3.5" />
                 )}
-                {busyAction === 'immich-ingest' ? 'Pulling...' : 'Pull & Scan'}
+                {isPulling
+                  ? `Pulling ${pullProgress?.percent ?? 0}%...`
+                  : 'Pull & Scan'}
               </button>
             </div>
 
             {immichStatus.source === 'saved' && (
               <button
                 type="button"
-                disabled={busyAction !== null}
+                disabled={busyAction !== null || isPulling}
                 onClick={async () => {
                   setTestResult(null);
                   await onDisconnectImmich();
                   setImmichUrl('');
                   setImmichApiKey('');
                 }}
-                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 whitespace-nowrap shrink-0 transition-colors"
+                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 disabled:opacity-45 whitespace-nowrap shrink-0 transition-colors"
               >
                 <Unplug className="h-3.5 w-3.5" />
                 Disconnect
@@ -476,18 +576,29 @@ export function LibraryIngestView({
               }`}
             >
               <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#151923] text-zinc-500 dark:text-zinc-400">
-                {uploadProgress ? (
+                {uploadStatus ? (
                   <Loader2 className="h-5 w-5 animate-spin text-indigo-600 dark:text-indigo-400" />
                 ) : (
                   <ImagePlus className="h-5 w-5" />
                 )}
               </div>
-              <p className="mt-3 text-xs font-medium text-zinc-800 dark:text-zinc-200">
-                {uploadProgress || 'Drop JPEG, PNG, or WebP photos here, or click to browse'}
+              <p className="mt-3 text-xs font-medium text-zinc-800 dark:text-zinc-200 tabular-nums">
+                {uploadStatus
+                  ? `${uploadStatus.text} (${uploadStatus.percent}%)`
+                  : 'Drop JPEG, PNG, or WebP photos here, or click to browse'}
               </p>
-              <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
-                Resized to 320px in-browser before server-side CIELAB extraction · Up to 40 photos per batch
-              </p>
+              {uploadStatus ? (
+                <div className="mt-3 h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-zinc-200 dark:bg-white/[0.08]">
+                  <div
+                    className="h-full w-full origin-left rounded-full bg-indigo-600 dark:bg-indigo-400 transition-transform duration-200 ease-out"
+                    style={{ transform: `scaleX(${Math.max(4, uploadStatus.percent) / 100})` }}
+                  />
+                </div>
+              ) : (
+                <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Resized to 320px in-browser before server-side CIELAB extraction · Up to 60 photos per batch
+                </p>
+              )}
               <input
                 ref={fileInputRef}
                 type="file"
@@ -512,7 +623,7 @@ export function LibraryIngestView({
               SQLite Asset &amp; Feature Cache
             </h2>
             <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
-              Showing {filtered.length} of {assets.length} indexed assets
+              Showing {filtered.length.toLocaleString()} of {assets.length.toLocaleString()} indexed assets
             </p>
           </div>
 
@@ -560,7 +671,7 @@ export function LibraryIngestView({
             {assets.length > 0 && (
               <button
                 type="button"
-                disabled={busyAction !== null}
+                disabled={busyAction !== null || isPulling}
                 onClick={onClearLocalCache}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 dark:border-white/[0.10] px-3 py-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:text-rose-600 hover:border-rose-200 hover:bg-rose-50/60 dark:hover:text-rose-400 dark:hover:border-rose-500/30 dark:hover:bg-rose-950/30 disabled:opacity-45 whitespace-nowrap shrink-0 transition-colors"
               >
@@ -603,7 +714,7 @@ export function LibraryIngestView({
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-100 dark:divide-white/[0.06]">
-                {filtered.map((asset) => (
+                {filtered.slice(0, 250).map((asset) => (
                   <tr
                     key={asset.id}
                     className="hover:bg-zinc-50/70 dark:hover:bg-white/[0.025] transition-colors"
@@ -663,6 +774,11 @@ export function LibraryIngestView({
                 ))}
               </tbody>
             </table>
+            {filtered.length > 250 && (
+              <div className="border-t border-zinc-100 dark:border-white/[0.06] px-6 py-3 text-xs text-zinc-500 dark:text-zinc-400">
+                Showing first 250 of {filtered.length.toLocaleString()} matching assets. Use the search box above to narrow down specific files or cities.
+              </div>
+            )}
           </div>
         )}
       </section>

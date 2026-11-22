@@ -35,11 +35,16 @@ export interface AssetRecord {
   originalPath: string;
   localDateTime: string;
   city: string | null;
+  state: string | null;
   country: string | null;
   latitude: number | null;
   longitude: number | null;
   exifMake: string | null;
   exifModel: string | null;
+  lensModel: string | null;
+  focalLength: number | null;
+  iso: number | null;
+  isFavorite: boolean;
   width: number;
   height: number;
   isArchived: boolean;
@@ -48,6 +53,7 @@ export interface AssetRecord {
   isScreenshot: boolean;
   excludedReason: string | null;
   peopleIds: string[];
+  peopleNames: string[];
   smartTags: string[];
   thumbnailUrl: string;
   avgLab: LabMean | null;
@@ -61,6 +67,12 @@ export interface EmdTimelinePoint {
   fileName: string;
   timestamp: string;
   emdScore: number;
+  compositeScore?: number;
+  gpsShift?: number;
+  semanticShift?: number;
+  peopleShift?: number;
+  exifShift?: number;
+  splitSignals?: string[];
   gapMinutes: number;
   labL: number;
   labB: number; // warm (+) vs cool (-)
@@ -70,6 +82,17 @@ export interface EmdTimelinePoint {
 
 export type ClusterStatus = 'pending' | 'approved' | 'synced' | 'discarded';
 export type ClusterType = 'trip' | 'local_event' | 'chapter';
+
+export interface ClusterSignalBreakdown {
+  gps: boolean;
+  immichMl: boolean;
+  chroma: boolean;
+  faces: boolean;
+  exif: boolean;
+  favoriteCount: number;
+  topTags: string[];
+  namedPeople: string[];
+}
 
 export interface ClusterRecord {
   id: string;
@@ -87,6 +110,7 @@ export interface ClusterRecord {
   palette: PaletteSwatch[];
   avgLab: LabMean;
   emdBoundaryScore: number;
+  signalBreakdown?: ClusterSignalBreakdown;
   status: ClusterStatus;
   immichAlbumId: string | null;
   syncedAssetCount: number;
@@ -94,6 +118,18 @@ export interface ClusterRecord {
   assets?: AssetRecord[];
   emdSeries?: EmdTimelinePoint[];
   updatedAt: string;
+}
+
+export type HomeBaseMode = 'auto' | 'manual' | 'disabled';
+
+export interface CandidateHomeBase {
+  city: string;
+  country: string | null;
+  geohash: string;
+  lat: number;
+  lng: number;
+  assetCount: number;
+  distinctDays: number;
 }
 
 export interface OrganizerSettings {
@@ -108,8 +144,14 @@ export interface OrganizerSettings {
   useStructuredPrefix: boolean;
   createMasterAlbum: boolean;
   createMoodSubalbums: boolean;
+  ignoreScreenshots: boolean;
   excludedPaths: string[];
+  homeBaseMode: HomeBaseMode;
+  homeBaseCityOverride: string;
+  homeBaseLatOverride: number | null;
+  homeBaseLngOverride: number | null;
   scanIntervalHours: number;
+  maxAssetsPerPull: number; // 0 = All Photos
   lastScanAt: string | null;
 }
 
@@ -126,13 +168,21 @@ export interface Stage1Stats {
 
 export interface Stage2Stats {
   homeBaseCity: string;
+  homeBaseCountry: string | null;
   homeBaseGeohash: string;
   homeBaseLat: number;
   homeBaseLng: number;
   homeBaseAssetCount: number;
+  homeBaseDistinctDays: number;
+  homeBaseSource: HomeBaseMode;
+  candidateHomeBases: CandidateHomeBase[];
   householdPeopleIds: string[];
   macroTripCount: number;
   localEventCount: number;
+  bridgedNoGpsCount?: number;
+  gpsTaggedCount?: number;
+  mlTaggedCount?: number;
+  faceTaggedCount?: number;
   unclusteredNoiseCount: number;
 }
 
@@ -141,6 +191,13 @@ export interface Stage3Stats {
   sceneSplitsDetected: number;
   totalChaptersCreated: number;
   moodDistribution: Record<string, number>;
+  signalUsage?: {
+    chroma: number;
+    immichMl: number;
+    gps: number;
+    faces: number;
+    exif: number;
+  };
 }
 
 export interface PipelineRunSummary {
@@ -193,3 +250,32 @@ export interface DashboardBootstrap {
   pipelineSummary: PipelineRunSummary | null;
   syncHistory: SyncHistoryRecord[];
 }
+
+export type PullPhase =
+  | 'idle'
+  | 'connecting'
+  | 'albums'
+  | 'metadata'
+  | 'smart_search'
+  | 'thumbnails'
+  | 'saving'
+  | 'clustering'
+  | 'done'
+  | 'error';
+
+export interface PullProgressState {
+  active: boolean;
+  phase: PullPhase;
+  percent: number;
+  label: string;
+  detail: string;
+  current: number;
+  total: number;
+  cachedCount: number;
+  ingestedCount: number;
+  cancelRequested: boolean;
+  startedAt: string | null;
+  updatedAt: string;
+  error: string | null;
+}
+

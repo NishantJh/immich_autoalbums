@@ -10,7 +10,7 @@
   <Project>https://github.com/NishantJh/immich_autoalbums</Project>
   <ReadMe>https://github.com/NishantJh/immich_autoalbums#readme</ReadMe>
   <License>MIT</License>
-  <Overview>ChromaCluster — Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
+  <Overview>ChromaCluster — Smart Immich Album Creator powered by advanced multi-signal feature analysis. Automatically discovers and proposes albums by fusing GPS coordinates, Immich machine learning visual analysis (CLIP Smart Search &amp; facial recognition), perceptual CIELAB chroma/color-tone clustering, EXIF camera &amp; lighting metadata, and time patterns, with human-in-the-loop review before syncing to Immich.</Overview>
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:3000]</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/unraid/immich-autoalbums.xml</TemplateURL>

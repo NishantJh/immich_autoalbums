@@ -9,6 +9,7 @@ interface PipelineLabViewProps {
   isRunning: boolean;
   onApplyAndRun: (partial: Partial<OrganizerSettings>) => Promise<void>;
   onClearCacheAndRun: () => Promise<void>;
+  onOpenRules: () => void;
 }
 
 export function PipelineLabView({
@@ -17,6 +18,7 @@ export function PipelineLabView({
   isRunning,
   onApplyAndRun,
   onClearCacheAndRun,
+  onOpenRules,
 }: PipelineLabViewProps) {
   const [homeRadiusKm, setHomeRadiusKm] = useState(settings.homeRadiusKm);
   const [tripGapHours, setTripGapHours] = useState(settings.tripGapHours);
@@ -56,9 +58,12 @@ export function PipelineLabView({
 
   const homeBaseLabel =
     summary && summary.stage2.homeBaseCity && summary.stage2.homeBaseCity !== '—'
-      ? summary.stage2.homeBaseGeohash && summary.stage2.homeBaseGeohash !== '—'
-        ? `${summary.stage2.homeBaseCity} (${summary.stage2.homeBaseGeohash})`
-        : summary.stage2.homeBaseCity
+      ? summary.stage2.homeBaseSource === 'disabled'
+        ? 'Disabled'
+        : summary.stage2.homeBaseCountry &&
+            summary.stage2.homeBaseCountry !== summary.stage2.homeBaseCity
+          ? `${summary.stage2.homeBaseCity}, ${summary.stage2.homeBaseCountry}`
+          : summary.stage2.homeBaseCity
       : 'Not inferred';
 
   const moodEntries = summary ? Object.entries(summary.stage3.moodDistribution).slice(0, 4) : [];
@@ -104,7 +109,9 @@ export function PipelineLabView({
               </div>
               <dl className="space-y-1.5 text-xs text-zinc-600 dark:text-zinc-400">
                 <div className="flex justify-between gap-2">
-                  <dt>Screenshots filtered</dt>
+                  <dt>
+                    Screenshots filtered{!settings.ignoreScreenshots ? ' (off)' : ''}
+                  </dt>
                   <dd className="font-mono tabular-nums text-zinc-900 dark:text-zinc-200">
                     {summary.stage1.excludedScreenshots}
                   </dd>
@@ -134,7 +141,7 @@ export function PipelineLabView({
             {/* Stage 2 */}
             <div className="p-5 space-y-3">
               <div className="text-xs font-medium text-indigo-600 dark:text-indigo-400">
-                02. Spatiotemporal Grouping
+                02. Multi-Signal Event Fusion
               </div>
               <div className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
                 {summary.stage2.macroTripCount + summary.stage2.localEventCount}{' '}
@@ -144,28 +151,43 @@ export function PipelineLabView({
               </div>
               <dl className="space-y-1.5 text-xs text-zinc-600 dark:text-zinc-400">
                 <div className="flex justify-between gap-2">
-                  <dt>Inferred home base</dt>
+                  <dt className="flex items-center gap-1.5">
+                    <span>
+                      {summary.stage2.homeBaseSource === 'manual'
+                        ? 'Manual home base'
+                        : summary.stage2.homeBaseSource === 'disabled'
+                          ? 'Home base'
+                          : 'Inferred home base'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onOpenRules}
+                      className="text-[11px] font-medium text-indigo-600 dark:text-indigo-400 hover:underline"
+                    >
+                      Edit
+                    </button>
+                  </dt>
                   <dd className="font-medium text-zinc-900 dark:text-zinc-200 truncate text-right">
                     {homeBaseLabel}
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2">
-                  <dt>Macro trips (&gt;{settings.homeRadiusKm} km)</dt>
+                  <dt>Trips / local events</dt>
                   <dd className="font-mono tabular-nums text-zinc-900 dark:text-zinc-200">
-                    {summary.stage2.macroTripCount}
+                    {summary.stage2.macroTripCount} / {summary.stage2.localEventCount}
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2">
-                  <dt>Local home-city events</dt>
+                  <dt>GPS / Immich ML / Faces</dt>
                   <dd className="font-mono tabular-nums text-zinc-900 dark:text-zinc-200">
-                    {summary.stage2.localEventCount}
+                    {summary.stage2.gpsTaggedCount ?? 0} / {summary.stage2.mlTaggedCount ?? 0} /{' '}
+                    {summary.stage2.faceTaggedCount ?? 0}
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2 pt-1.5 border-t border-zinc-100 dark:border-white/[0.06]">
-                  <dt>Household faces / noise</dt>
+                  <dt>Bridged DSLR / noise</dt>
                   <dd className="font-mono tabular-nums text-zinc-900 dark:text-zinc-200">
-                    {summary.stage2.householdPeopleIds.length} /{' '}
-                    {summary.stage2.unclusteredNoiseCount}
+                    {summary.stage2.bridgedNoGpsCount ?? 0} / {summary.stage2.unclusteredNoiseCount}
                   </dd>
                 </div>
               </dl>
@@ -174,7 +196,7 @@ export function PipelineLabView({
             {/* Stage 3 */}
             <div className="p-5 space-y-3">
               <div className="text-xs font-medium text-indigo-600 dark:text-indigo-400">
-                03. CIELAB Color-Tone Split
+                03. Chroma + ML Scene Split
               </div>
               <div className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
                 {summary.stage3.sceneSplitsDetected}{' '}
@@ -196,7 +218,7 @@ export function PipelineLabView({
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2">
-                  <dt>EMD split threshold</dt>
+                  <dt>Fusion split threshold</dt>
                   <dd className="font-mono tabular-nums text-zinc-900 dark:text-zinc-200">
                     &ge; {settings.emdThreshold.toFixed(2)}
                   </dd>

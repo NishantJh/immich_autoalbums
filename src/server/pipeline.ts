@@ -4,7 +4,9 @@ import path from 'path';
 import type {
   AestheticMood,
   AssetRecord,
+  CandidateHomeBase,
   ClusterRecord,
+  ClusterSignalBreakdown,
   EmdTimelinePoint,
   LabHistogram,
   LabMean,
@@ -65,6 +67,58 @@ function isSuspectedScreenshot(asset: AssetRecord): boolean {
   if (!missingCameraExif || asset.width <= 0 || asset.height <= 0) return false;
   const ratio = asset.width / asset.height;
   return SCREEN_ASPECT_RATIOS.some((r) => Math.abs(ratio - r) < 0.035);
+}
+
+function isValidGps(lat: number | null, lng: number | null): lat is number {
+  if (lat === null || lng === null) return false;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+  // Reject Null Island (0, 0) placeholder GPS tags
+  if (Math.abs(lat) < 0.001 && Math.abs(lng) < 0.001) return false;
+  return true;
+}
+
+const CYRILLIC_RE = /[\u0400-\u04FF]/;
+const CYRILLIC_COUNTRY_RE =
+  /russia|belarus|ukraine|kazakhstan|kyrgyzstan|bulgaria|serbia|macedonia|mongolia|tajikistan|uzbekistan|montenegro|bosnia/i;
+
+function sanitizePlaceName(
+  rawCity: string | null | undefined,
+  country: string | null | undefined
+): string | null {
+  const city = (rawCity || '').trim();
+  if (!city) return null;
+  const c = (country || '').trim();
+  // Guard against stray Cyrillic/Russian GeoNames labels attached to non-Cyrillic countries
+  if (CYRILLIC_RE.test(city) && c && !CYRILLIC_COUNTRY_RE.test(c)) {
+    return null;
+  }
+  return city;
+}
+
+function pickBucketCity(
+  cities: Map<string, number>,
+  country: string | null,
+  fallbackLat: number,
+  fallbackLng: number
+): string {
+  const allowCyrillic = country ? CYRILLIC_COUNTRY_RE.test(country) : false;
+  const entries = Array.from(cities.entries()).sort((x, y) => y[1] - x[1]);
+
+  // First prefer clean Latin-script names (or any name if inside a Cyrillic-script country)
+  for (const [name] of entries) {
+    if (allowCyrillic || !CYRILLIC_RE.test(name)) {
+      return name;
+    }
+  }
+
+  if (country && !CYRILLIC_RE.test(country)) {
+    return country;
+  }
+  if (entries.length > 0 && allowCyrillic) {
+    return entries[0][0];
+  }
+  return `${fallbackLat.toFixed(2)}, ${fallbackLng.toFixed(2)}`;
 }
 
 function encodeGeohash5(lat: number, lng: number): string {
@@ -136,21 +190,152 @@ function formatMonthYear(iso: string): string {
   });
 }
 
+function jaccardSimilarity(a: Iterable<string>, b: Iterable<string>): number {
+  const setA = new Set(a);
+  const setB = new Set(b);
+  if (setA.size === 0 && setB.size === 0) return 0;
+  let intersection = 0;
+  for (const item of setA) {
+    if (setB.has(item)) intersection++;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function computeGpsCentroid(items: EnrichedAsset[]): { lat: number; lng: number } | null {
+  let latSum = 0;
+  let lngSum = 0;
+  let n = 0;
+  for (const item of items) {
+    if (isValidGps(item.asset.latitude, item.asset.longitude) && item.asset.longitude !== null) {
+      latSum += item.asset.latitude;
+      lngSum += item.asset.longitude;
+      n++;
+    }
+  }
+  if (n === 0) return null;
+  return { lat: latSum / n, lng: lngSum / n };
+}
+
+function computeExifLightingShift(before: EnrichedAsset[], after: EnrichedAsset[]): number | null {
+  const isoBefore = before
+    .map((x) => x.asset.iso)
+    .filter((v): v is number => typeof v === 'number' && v > 0);
+  const isoAfter = after
+    .map((x) => x.asset.iso)
+    .filter((v): v is number => typeof v === 'number' && v > 0);
+
+  const camBefore = new Set(
+    before.map((x) => x.asset.exifModel || x.asset.lensModel).filter(Boolean)
+  );
+  const camAfter = new Set(
+    after.map((x) => x.asset.exifModel || x.asset.lensModel).filter(Boolean)
+  );
+
+  let isoShift: number | null = null;
+  if (isoBefore.length > 0 && isoAfter.length > 0) {
+    const meanLogBefore =
+      isoBefore.reduce((s, v) => s + Math.log2(v), 0) / isoBefore.length;
+    const meanLogAfter =
+      isoAfter.reduce((s, v) => s + Math.log2(v), 0) / isoAfter.length;
+    // 4 stops of ISO change (e.g. ISO 100 daylight -> ISO 1600 indoor/night) = 1.0 shift
+    isoShift = Math.min(1, Math.abs(meanLogAfter - meanLogBefore) / 4);
+  }
+
+  let camShift: number | null = null;
+  if (camBefore.size > 0 && camAfter.size > 0) {
+    camShift = 1 - jaccardSimilarity(camBefore as Set<string>, camAfter as Set<string>);
+  }
+
+  if (isoShift !== null && camShift !== null) {
+    return Number((isoShift * 0.7 + camShift * 0.3).toFixed(3));
+  }
+  if (isoShift !== null) return Number(isoShift.toFixed(3));
+  if (camShift !== null) return Number((camShift * 0.5).toFixed(3));
+  return null;
+}
+
+function buildClusterSignalBreakdown(items: EnrichedAsset[]): ClusterSignalBreakdown {
+  const tagCounts = new Map<string, number>();
+  const personNameCounts = new Map<string, number>();
+  let gpsCount = 0;
+  let mlCount = 0;
+  let faceCount = 0;
+  let exifCount = 0;
+  let favoriteCount = 0;
+
+  for (const item of items) {
+    const a = item.asset;
+    if (isValidGps(a.latitude, a.longitude)) gpsCount++;
+    if (a.smartTags.length > 0) {
+      mlCount++;
+      for (const t of a.smartTags) {
+        tagCounts.set(t, (tagCounts.get(t) || 0) + 1);
+      }
+    }
+    if (a.peopleIds.length > 0) faceCount++;
+    for (const name of a.peopleNames || []) {
+      if (name.trim()) {
+        personNameCounts.set(name.trim(), (personNameCounts.get(name.trim()) || 0) + 1);
+      }
+    }
+    if (a.exifModel || a.lensModel || a.iso !== null) exifCount++;
+    if (a.isFavorite) favoriteCount++;
+  }
+
+  const topTags = Array.from(tagCounts.entries())
+    .sort((x, y) => y[1] - x[1])
+    .slice(0, 4)
+    .map(([t]) => t);
+  const namedPeople = Array.from(personNameCounts.entries())
+    .sort((x, y) => y[1] - x[1])
+    .slice(0, 4)
+    .map(([p]) => p);
+
+  return {
+    gps: gpsCount > 0,
+    immichMl: mlCount > 0,
+    chroma: true,
+    faces: faceCount > 0,
+    exif: exifCount > 0,
+    favoriteCount,
+    topTags,
+    namedPeople,
+  };
+}
+
 function pickTopOccasion(assets: EnrichedAsset[]): string | null {
   const counts = new Map<string, number>();
   const priorityLabels: Record<string, string> = {
     'wedding ceremony': 'Wedding Ceremony',
+    'birthday party': 'Birthday Celebration',
     'birthday cake': 'Birthday Celebration',
     celebration: 'Birthday Celebration',
+    'beach ocean': 'Beach',
     beach: 'Beach',
+    'sunset sunrise': 'Sunset',
     sunset: 'Sunset',
-    hiking: 'Highland Trek',
-    mountains: 'Highland Trek',
+    'mountain hiking': 'Mountain Hike',
+    hiking: 'Mountain Hike',
+    mountains: 'Mountain Hike',
+    'restaurant dinner': 'Dinner',
     dinner: 'Dinner',
     nightlife: 'Nightlife',
+    'city architecture': 'Architecture Walk',
     architecture: 'Architecture Walk',
     promenade: 'Promenade Walk',
+    'concert stage': 'Live Concert',
     concert: 'Live Concert',
+    'snow skiing': 'Snow & Winter',
+    'museum art gallery': 'Museum & Art',
+    'family portrait': 'Family Gathering',
+    'pet dog cat': 'Pets',
+    'sports game': 'Sports',
+    'fireworks festival': 'Festival',
+    'coffee cafe': 'Cafe Outing',
+    'temple monument': 'Heritage & Temples',
+    'garden flowers': 'Garden & Nature',
+    'road trip': 'Road Trip',
   };
 
   for (const item of assets) {
@@ -172,6 +357,29 @@ function pickTopOccasion(assets: EnrichedAsset[]): string | null {
     }
   }
   return best;
+}
+
+function pickGuestCompanionTitle(
+  assets: EnrichedAsset[],
+  householdPeople: Set<string>
+): string | null {
+  const nameCounts = new Map<string, number>();
+  for (const item of assets) {
+    const names = item.asset.peopleNames || [];
+    const ids = item.asset.peopleIds || [];
+    for (let i = 0; i < names.length; i++) {
+      const pid = ids[i];
+      if (pid && householdPeople.has(pid)) continue;
+      const n = names[i]?.trim();
+      if (n) nameCounts.set(n, (nameCounts.get(n) || 0) + 1);
+    }
+  }
+  const topNames = Array.from(nameCounts.entries())
+    .sort((x, y) => y[1] - x[1])
+    .slice(0, 2)
+    .map(([n]) => n);
+  if (topNames.length === 0) return null;
+  return `With ${topNames.join(' & ')}`;
 }
 
 function computeAvgLab(items: EnrichedAsset[]): LabMean {
@@ -284,7 +492,7 @@ export function runFullPipeline(): {
         a.originalPath.toLowerCase().includes(rule.toLowerCase())
       );
       reason = `Excluded path rule (${matched})`;
-    } else if (isSuspectedScreenshot(a)) {
+    } else if (settings.ignoreScreenshots && isSuspectedScreenshot(a)) {
       excludedScreenshots++;
       shot = true;
       reason = 'Suspected screenshot (no camera EXIF + screen aspect ratio)';
@@ -368,73 +576,319 @@ export function runFullPipeline(): {
 
   // =========================================================================
   // STAGE 2: Spatiotemporal Grouping
-  //   1. Home-Base Inference (5km geohash cluster)
+  //   1. Home-Base Inference (distinct calendar days per 5km geohash, or Manual/Disabled override)
   //   2. Trips (outside homeRadiusKm, merged across gaps < tripGapHours)
   //   3. Local Events (density clustering on time + fine GPS + non-household faces)
   // =========================================================================
   const geohashBuckets = new Map<
     string,
-    { count: number; latSum: number; lngSum: number; cities: Map<string, number> }
+    {
+      count: number;
+      days: Set<string>;
+      latSum: number;
+      lngSum: number;
+      cities: Map<string, number>;
+      countries: Map<string, number>;
+    }
   >();
 
-  for (const item of eligible) {
-    const { latitude, longitude, city } = item.asset;
-    if (latitude === null || longitude === null) continue;
+  // Build candidate geohash buckets from eligible assets (fall back to all non-trashed if eligible has no GPS)
+  const gpsSourceAssets = eligible.some((e) => isValidGps(e.asset.latitude, e.asset.longitude))
+    ? eligible.map((e) => e.asset)
+    : allRows
+        .map((r) => r.asset)
+        .filter((a) => !a.isArchived && !a.isTrashed && isValidGps(a.latitude, a.longitude));
+
+  for (const a of gpsSourceAssets) {
+    const { latitude, longitude, city, country } = a;
+    if (!isValidGps(latitude, longitude) || longitude === null) continue;
     const gh = encodeGeohash5(latitude, longitude);
     const bucket = geohashBuckets.get(gh) || {
       count: 0,
+      days: new Set<string>(),
       latSum: 0,
       lngSum: 0,
       cities: new Map(),
+      countries: new Map(),
     };
     bucket.count++;
+    bucket.days.add((a.localDateTime || '').slice(0, 10));
     bucket.latSum += latitude;
     bucket.lngSum += longitude;
-    if (city) bucket.cities.set(city, (bucket.cities.get(city) || 0) + 1);
+    const cleanCity = sanitizePlaceName(city, country);
+    if (cleanCity) bucket.cities.set(cleanCity, (bucket.cities.get(cleanCity) || 0) + 1);
+    if (country && country.trim()) {
+      const cTrim = country.trim();
+      bucket.countries.set(cTrim, (bucket.countries.get(cTrim) || 0) + 1);
+    }
     geohashBuckets.set(gh, bucket);
   }
+
+  // Rank candidates by distinct calendar days first (true residency signal), then photo count
+  const candidateHomeBases: CandidateHomeBase[] = Array.from(geohashBuckets.entries())
+    .map(([gh, b]) => {
+      const avgLat = b.latSum / b.count;
+      const avgLng = b.lngSum / b.count;
+      const topCountry =
+        Array.from(b.countries.entries()).sort((x, y) => y[1] - x[1])[0]?.[0] || null;
+      const topCity = pickBucketCity(b.cities, topCountry, avgLat, avgLng);
+      return {
+        city: topCity,
+        country: topCountry,
+        geohash: gh,
+        lat: Number(avgLat.toFixed(4)),
+        lng: Number(avgLng.toFixed(4)),
+        assetCount: b.count,
+        distinctDays: b.days.size,
+      };
+    })
+    .sort((x, y) => y.distinctDays - x.distinctDays || y.assetCount - x.assetCount)
+    .slice(0, 20);
 
   let homeGeohash = '—';
   let homeLat = 0;
   let homeLng = 0;
   let homeCity = '—';
+  let homeCountry: string | null = null;
   let homeCount = 0;
+  let homeDistinctDays = 0;
+  let hasActiveHomeBase = false;
+  let effectiveHomeMode = settings.homeBaseMode;
 
-  for (const [gh, b] of geohashBuckets.entries()) {
-    if (b.count > homeCount) {
-      homeCount = b.count;
-      homeGeohash = gh;
-      homeLat = b.latSum / b.count;
-      homeLng = b.lngSum / b.count;
-      let topC = 'Home Base';
-      let topCC = 0;
-      for (const [c, cnt] of b.cities.entries()) {
-        if (cnt > topCC) {
-          topCC = cnt;
-          topC = c;
+  if (
+    settings.homeBaseMode === 'manual' &&
+    isValidGps(settings.homeBaseLatOverride, settings.homeBaseLngOverride) &&
+    settings.homeBaseLngOverride !== null
+  ) {
+    homeLat = settings.homeBaseLatOverride;
+    homeLng = settings.homeBaseLngOverride;
+    homeGeohash = encodeGeohash5(homeLat, homeLng);
+    homeCity =
+      settings.homeBaseCityOverride.trim() ||
+      `Custom (${homeLat.toFixed(2)}, ${homeLng.toFixed(2)})`;
+    hasActiveHomeBase = true;
+    const homeDaySet = new Set<string>();
+    const nearCountries = new Map<string, number>();
+    for (const item of eligible) {
+      const { latitude, longitude, country } = item.asset;
+      if (isValidGps(latitude, longitude) && longitude !== null) {
+        if (haversineKm(homeLat, homeLng, latitude, longitude) <= settings.homeRadiusKm) {
+          homeCount++;
+          homeDaySet.add(item.asset.localDateTime.slice(0, 10));
+          if (country) nearCountries.set(country, (nearCountries.get(country) || 0) + 1);
         }
       }
-      homeCity = topC;
+    }
+    homeDistinctDays = homeDaySet.size;
+    homeCountry =
+      Array.from(nearCountries.entries()).sort((x, y) => y[1] - x[1])[0]?.[0] || null;
+  } else if (settings.homeBaseMode === 'disabled') {
+    homeCity = 'Disabled';
+    homeGeohash = '—';
+    hasActiveHomeBase = false;
+  } else {
+    effectiveHomeMode = 'auto';
+    const topCandidate = candidateHomeBases[0];
+    if (topCandidate) {
+      homeCity = topCandidate.city;
+      homeCountry = topCandidate.country;
+      homeGeohash = topCandidate.geohash;
+      homeLat = topCandidate.lat;
+      homeLng = topCandidate.lng;
+      homeCount = topCandidate.assetCount;
+      homeDistinctDays = topCandidate.distinctDays;
+      hasActiveHomeBase = true;
     }
   }
 
-  // Partition assets into Away (Trips) vs Home-Radius (Local Events)
+  // Partition assets into Away (Trips), Home-Radius, and No-GPS (candidates for Trip bridging or Local Events)
   const awayAssets: EnrichedAsset[] = [];
-  const homeAssets: EnrichedAsset[] = [];
+  const homeGeoAssets: EnrichedAsset[] = [];
+  const noGpsAssets: EnrichedAsset[] = [];
 
   for (const item of eligible) {
     const { latitude, longitude } = item.asset;
-    if (latitude !== null && longitude !== null && homeCount > 0) {
-      const distKm = haversineKm(homeLat, homeLng, latitude, longitude);
-      if (distKm > settings.homeRadiusKm) {
+    if (isValidGps(latitude, longitude) && longitude !== null) {
+      if (effectiveHomeMode === 'disabled') {
         awayAssets.push(item);
+      } else if (hasActiveHomeBase) {
+        const distKm = haversineKm(homeLat, homeLng, latitude, longitude);
+        if (distKm > settings.homeRadiusKm) {
+          awayAssets.push(item);
+        } else {
+          homeGeoAssets.push(item);
+        }
       } else {
-        homeAssets.push(item);
+        homeGeoAssets.push(item);
       }
     } else {
-      homeAssets.push(item);
+      noGpsAssets.push(item);
     }
   }
+
+  interface RawEvent {
+    id: string;
+    type: 'trip' | 'local_event';
+    assets: EnrichedAsset[];
+    locationLabel: string;
+    eventName: string;
+  }
+
+  const rawEvents: RawEvent[] = [];
+  let unclusteredNoiseCount = 0;
+  let bridgedNoGpsCount = 0;
+
+  // 2A. Multi-Signal Macro Trip Clustering (GPS + Time + State/Country + Immich ML + People + CIELAB Chroma)
+  const tripGapMs = settings.tripGapHours * 3600 * 1000;
+  const rawTripBuckets: EnrichedAsset[][] = [];
+  let currentTrip: EnrichedAsset[] = [];
+
+  const canContinueTrip = (prev: EnrichedAsset, next: EnrichedAsset): boolean => {
+    const gap = next.timestampMs - prev.timestampMs;
+    if (gap > tripGapMs) return false;
+
+    const distKm =
+      isValidGps(prev.asset.latitude, prev.asset.longitude) &&
+      isValidGps(next.asset.latitude, next.asset.longitude)
+        ? haversineKm(
+            prev.asset.latitude,
+            prev.asset.longitude!,
+            next.asset.latitude,
+            next.asset.longitude!
+          )
+        : null;
+
+    // Hard spatial separation for long-haul jumps (> 320 km)
+    if (distKm !== null && distKm > 320) return false;
+    // Direct regional continuity (< 120 km)
+    if (distKm !== null && distKm <= 120) return true;
+    // Same city continuity
+    if (prev.asset.city && next.asset.city && prev.asset.city === next.asset.city) return true;
+
+    // Road-trip / multi-stop bridge (120–320 km) reinforced by State/Country + ML tags + Faces + Chroma
+    const sameRegionAdmin =
+      (prev.asset.state && next.asset.state && prev.asset.state === next.asset.state) ||
+      (prev.asset.country && next.asset.country && prev.asset.country === next.asset.country);
+    if (sameRegionAdmin) {
+      const mlOverlap = jaccardSimilarity(prev.asset.smartTags, next.asset.smartTags);
+      const peopleOverlap = jaccardSimilarity(prev.asset.peopleIds, next.asset.peopleIds);
+      const chromaSim = 1 - computeLabHistogramEmd(prev.histogram, next.histogram);
+      if (peopleOverlap > 0 || mlOverlap >= 0.25 || chromaSim >= 0.68) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  for (const item of awayAssets) {
+    if (currentTrip.length === 0) {
+      currentTrip.push(item);
+      continue;
+    }
+    const prev = currentTrip[currentTrip.length - 1];
+    if (canContinueTrip(prev, item)) {
+      currentTrip.push(item);
+    } else {
+      rawTripBuckets.push(currentTrip);
+      currentTrip = [item];
+    }
+  }
+  if (currentTrip.length > 0) {
+    rawTripBuckets.push(currentTrip);
+  }
+
+  // 2A+. DSLR / No-GPS Photo Bridging:
+  // Bridge non-geotagged photos shot during a Trip window (within 4h) when Chroma/ML/Faces/Camera align
+  const remainingNoGps: EnrichedAsset[] = [];
+  const bridgeWindowMs = 4 * 3600 * 1000;
+
+  for (const item of noGpsAssets) {
+    let matchedTrip: EnrichedAsset[] | null = null;
+    let bestScore = 0;
+
+    for (const trip of rawTripBuckets) {
+      if (trip.length === 0) continue;
+      const tStart = trip[0].timestampMs - bridgeWindowMs;
+      const tEnd = trip[trip.length - 1].timestampMs + bridgeWindowMs;
+      if (item.timestampMs < tStart || item.timestampMs > tEnd) continue;
+
+      // Find chronologically nearest photo in this trip
+      let nearest = trip[0];
+      let minDt = Math.abs(item.timestampMs - nearest.timestampMs);
+      for (const candidate of trip) {
+        const dt = Math.abs(item.timestampMs - candidate.timestampMs);
+        if (dt < minDt) {
+          minDt = dt;
+          nearest = candidate;
+        }
+      }
+      if (minDt > bridgeWindowMs) continue;
+
+      const timeAffinity = Math.max(0, 1 - minDt / bridgeWindowMs);
+      const chromaAffinity = 1 - computeLabHistogramEmd(item.histogram, nearest.histogram);
+      const mlAffinity = jaccardSimilarity(item.asset.smartTags, nearest.asset.smartTags);
+      const peopleAffinity = jaccardSimilarity(item.asset.peopleIds, nearest.asset.peopleIds);
+      const score =
+        timeAffinity * 0.45 +
+        chromaAffinity * 0.30 +
+        mlAffinity * 0.15 +
+        peopleAffinity * 0.10;
+
+      if (score >= 0.48 && score > bestScore) {
+        bestScore = score;
+        matchedTrip = trip;
+      }
+    }
+
+    if (matchedTrip) {
+      matchedTrip.push(item);
+      bridgedNoGpsCount++;
+    } else {
+      remainingNoGps.push(item);
+    }
+  }
+
+  // Finalize Macro Trips
+  for (const bucket of rawTripBuckets) {
+    bucket.sort((x, y) => x.timestampMs - y.timestampMs);
+    if (bucket.length >= settings.minPhotosPerAlbum) {
+      const cityCounts = new Map<string, number>();
+      const countryCounts = new Map<string, number>();
+      for (const a of bucket) {
+        const cleanC = sanitizePlaceName(a.asset.city, a.asset.country);
+        const c = cleanC || a.asset.country || 'Away';
+        cityCounts.set(c, (cityCounts.get(c) || 0) + 1);
+        if (a.asset.country) {
+          countryCounts.set(a.asset.country, (countryCounts.get(a.asset.country) || 0) + 1);
+        }
+      }
+      const country =
+        Array.from(countryCounts.entries()).sort((x, y) => y[1] - x[1])[0]?.[0] || null;
+      const centroid = computeGpsCentroid(bucket);
+      const topCity = pickBucketCity(
+        cityCounts,
+        country,
+        centroid?.lat || 0,
+        centroid?.lng || 0
+      );
+      const locationLabel = country && country !== topCity ? `${topCity}, ${country}` : topCity;
+      rawEvents.push({
+        id: `evt-trip-${topCity.toLowerCase().replace(/[^a-z0-9]/g, '')}-${formatYearMonth(bucket[0].asset.localDateTime)}-${rawEvents.length + 1}`,
+        type: 'trip',
+        assets: bucket,
+        locationLabel,
+        eventName: effectiveHomeMode === 'disabled' ? `${topCity}` : `${topCity} Trip`,
+      });
+    } else {
+      unclusteredNoiseCount += bucket.length;
+    }
+  }
+
+  // Combine remaining local + unbridged no-GPS photos chronologically for Local Event Discovery
+  const homeAssets: EnrichedAsset[] = [...homeGeoAssets, ...remainingNoGps].sort(
+    (x, y) => x.timestampMs - y.timestampMs
+  );
 
   // Identify household faces: people appearing across >40% of distinct home days
   const homeDays = new Set(homeAssets.map((a) => a.asset.localDateTime.slice(0, 10)));
@@ -454,71 +908,7 @@ export function runFullPipeline(): {
     }
   }
 
-  interface RawEvent {
-    id: string;
-    type: 'trip' | 'local_event';
-    assets: EnrichedAsset[];
-    locationLabel: string;
-    eventName: string;
-  }
-
-  const rawEvents: RawEvent[] = [];
-  let unclusteredNoiseCount = 0;
-
-  // 2A. Macro Trip Clustering (outside home radius, consecutive gaps < tripGapHours)
-  const tripGapMs = settings.tripGapHours * 3600 * 1000;
-  let currentTrip: EnrichedAsset[] = [];
-  const flushTrip = () => {
-    if (currentTrip.length >= settings.minPhotosPerAlbum) {
-      const cityCounts = new Map<string, number>();
-      for (const a of currentTrip) {
-        const c = a.asset.city || a.asset.country || 'Away';
-        cityCounts.set(c, (cityCounts.get(c) || 0) + 1);
-      }
-      const topCity =
-        Array.from(cityCounts.entries()).sort((x, y) => y[1] - x[1])[0]?.[0] || 'Away';
-      const country = currentTrip.find((a) => a.asset.country)?.asset.country;
-      const locationLabel = country && country !== topCity ? `${topCity}, ${country}` : topCity;
-      rawEvents.push({
-        id: `evt-trip-${topCity.toLowerCase().replace(/[^a-z0-9]/g, '')}-${formatYearMonth(currentTrip[0].asset.localDateTime)}`,
-        type: 'trip',
-        assets: [...currentTrip],
-        locationLabel,
-        eventName: `${topCity} Trip`,
-      });
-    } else {
-      unclusteredNoiseCount += currentTrip.length;
-    }
-    currentTrip = [];
-  };
-
-  for (const item of awayAssets) {
-    if (currentTrip.length === 0) {
-      currentTrip.push(item);
-      continue;
-    }
-    const prev = currentTrip[currentTrip.length - 1];
-    const gap = item.timestampMs - prev.timestampMs;
-    const sameRegion =
-      prev.asset.latitude !== null &&
-      item.asset.latitude !== null &&
-      haversineKm(
-        prev.asset.latitude,
-        prev.asset.longitude!,
-        item.asset.latitude,
-        item.asset.longitude!
-      ) < 120;
-
-    if (gap <= tripGapMs && (sameRegion || prev.asset.city === item.asset.city)) {
-      currentTrip.push(item);
-    } else {
-      flushTrip();
-      currentTrip.push(item);
-    }
-  }
-  flushTrip();
-
-  // 2B. Local Home-City Event Discovery (HDBSCAN-inspired spatiotemporal + face density)
+  // 2B. Multi-Signal Local Event Discovery (Chronological Window + GPS + Immich ML + CIELAB Chroma + Faces + EXIF)
   const localGapMs = settings.localEventGapHours * 3600 * 1000;
   const fineRadiusKm = settings.localEventRadiusMeters / 1000;
   const visited = new Set<number>();
@@ -528,29 +918,91 @@ export function runFullPipeline(): {
     const dt = Math.abs(a.timestampMs - b.timestampMs);
     if (dt > localGapMs) return false;
 
-    let spatialClose = true;
-    if (
-      a.asset.latitude !== null &&
-      a.asset.longitude !== null &&
-      b.asset.latitude !== null &&
-      b.asset.longitude !== null
-    ) {
-      const dKm = haversineKm(
-        a.asset.latitude,
-        a.asset.longitude,
-        b.asset.latitude,
-        b.asset.longitude
-      );
-      spatialClose = dKm <= fineRadiusKm * 2.5;
-    }
-
     const aGuests = a.asset.peopleIds.filter((p) => !householdPeople.has(p));
     const bGuests = b.asset.peopleIds.filter((p) => !householdPeople.has(p));
     const sharesGuest = aGuests.some((g) => bGuests.includes(g));
+    if (sharesGuest) return true;
 
-    return spatialClose || (sharesGuest && dt <= localGapMs);
+    const bothHaveGps =
+      isValidGps(a.asset.latitude, a.asset.longitude) &&
+      isValidGps(b.asset.latitude, b.asset.longitude);
+
+    let distKm: number | null = null;
+    if (bothHaveGps) {
+      distKm = haversineKm(
+        a.asset.latitude!,
+        a.asset.longitude!,
+        b.asset.latitude!,
+        b.asset.longitude!
+      );
+      // Fast-path: same exact venue burst within 2 hours
+      if (distKm <= fineRadiusKm * 1.6 && dt <= Math.min(localGapMs, 2 * 3600 * 1000)) {
+        return true;
+      }
+      // Hard reject if clearly different local venues (> 3.5x radius and > 1.5 km apart)
+      if (distKm > Math.max(1.5, fineRadiusKm * 4)) {
+        return false;
+      }
+    }
+
+    // Weighted multi-signal affinity fusion (re-normalized across active signals)
+    let weightedSum = 0;
+    let totalWeight = 0;
+
+    // 1. Temporal proximity (always active)
+    const timeScore = Math.max(0, 1 - dt / localGapMs);
+    weightedSum += timeScore * 0.24;
+    totalWeight += 0.24;
+
+    // 2. GPS proximity (when both have valid coordinates)
+    if (distKm !== null) {
+      const gpsScore = Math.max(0, 1 - distKm / Math.max(0.25, fineRadiusKm * 2.8));
+      weightedSum += gpsScore * 0.34;
+      totalWeight += 0.34;
+    }
+
+    // 3. Immich ML CLIP semantic similarity (when either asset has CLIP tags)
+    if (a.asset.smartTags.length > 0 || b.asset.smartTags.length > 0) {
+      const mlScore = jaccardSimilarity(a.asset.smartTags, b.asset.smartTags);
+      weightedSum += mlScore * 0.18;
+      totalWeight += 0.18;
+    }
+
+    // 4. CIELAB Chroma continuity (always active)
+    const chromaScore = Math.max(0, 1 - computeLabHistogramEmd(a.histogram, b.histogram));
+    weightedSum += chromaScore * 0.16;
+    totalWeight += 0.16;
+
+    // 5. People / Camera / EXIF lighting regime continuity
+    let contextScore = 0;
+    let hasContext = false;
+    if (a.asset.peopleIds.length > 0 && b.asset.peopleIds.length > 0) {
+      contextScore = Math.max(
+        contextScore,
+        jaccardSimilarity(a.asset.peopleIds, b.asset.peopleIds)
+      );
+      hasContext = true;
+    }
+    if (a.asset.iso && b.asset.iso) {
+      const isoDiff = Math.abs(Math.log2(a.asset.iso) - Math.log2(b.asset.iso));
+      const lightingSim = Math.max(0, 1 - isoDiff / 4);
+      contextScore = hasContext ? contextScore * 0.6 + lightingSim * 0.4 : lightingSim;
+      hasContext = true;
+    }
+    if (a.asset.exifModel && b.asset.exifModel && a.asset.exifModel === b.asset.exifModel) {
+      contextScore = hasContext ? Math.min(1, contextScore + 0.15) : 0.7;
+      hasContext = true;
+    }
+    if (hasContext) {
+      weightedSum += contextScore * 0.08;
+      totalWeight += 0.08;
+    }
+
+    const affinity = totalWeight > 0 ? weightedSum / totalWeight : 0;
+    return affinity >= 0.56;
   };
 
+  // Chronological-window BFS (O(N * K) instead of O(N^2) so 10,000+ photos cluster in milliseconds)
   let localIdx = 1;
   for (let i = 0; i < homeAssets.length; i++) {
     if (visited.has(i)) continue;
@@ -561,7 +1013,19 @@ export function runFullPipeline(): {
     while (queue.length > 0) {
       const curr = queue.shift()!;
       component.push(curr);
-      for (let j = 0; j < homeAssets.length; j++) {
+      const currTs = homeAssets[curr].timestampMs;
+
+      // Scan backward within localGapMs
+      for (let j = curr - 1; j >= 0; j--) {
+        if (currTs - homeAssets[j].timestampMs > localGapMs) break;
+        if (!visited.has(j) && areLocalNeighbors(homeAssets[curr], homeAssets[j])) {
+          visited.add(j);
+          queue.push(j);
+        }
+      }
+      // Scan forward within localGapMs
+      for (let j = curr + 1; j < homeAssets.length; j++) {
+        if (homeAssets[j].timestampMs - currTs > localGapMs) break;
         if (!visited.has(j) && areLocalNeighbors(homeAssets[curr], homeAssets[j])) {
           visited.add(j);
           queue.push(j);
@@ -573,8 +1037,18 @@ export function runFullPipeline(): {
       const members = component
         .map((idx) => homeAssets[idx])
         .sort((x, y) => x.timestampMs - y.timestampMs);
-      const occasion = pickTopOccasion(members) || `Local Gathering #${localIdx}`;
-      const city = members.find((m) => m.asset.city)?.asset.city || homeCity;
+      const occasion =
+        pickTopOccasion(members) ||
+        pickGuestCompanionTitle(members, householdPeople) ||
+        `Local Gathering #${localIdx}`;
+      const rawMemberCity = members.find((m) =>
+        sanitizePlaceName(m.asset.city, m.asset.country)
+      );
+      const city =
+        (rawMemberCity
+          ? sanitizePlaceName(rawMemberCity.asset.city, rawMemberCity.asset.country)
+          : null) ||
+        (hasActiveHomeBase ? homeCity : 'Local');
       const country = members.find((m) => m.asset.country)?.asset.country;
       const locationLabel = country && country !== city ? `${city}, ${country}` : city;
 
@@ -593,13 +1067,21 @@ export function runFullPipeline(): {
 
   const stage2: Stage2Stats = {
     homeBaseCity: homeCity,
+    homeBaseCountry: homeCountry,
     homeBaseGeohash: homeGeohash,
     homeBaseLat: Number(homeLat.toFixed(4)),
     homeBaseLng: Number(homeLng.toFixed(4)),
     homeBaseAssetCount: homeCount,
+    homeBaseDistinctDays: homeDistinctDays,
+    homeBaseSource: effectiveHomeMode,
+    candidateHomeBases,
     householdPeopleIds: Array.from(householdPeople),
     macroTripCount: rawEvents.filter((e) => e.type === 'trip').length,
     localEventCount: rawEvents.filter((e) => e.type === 'local_event').length,
+    bridgedNoGpsCount,
+    gpsTaggedCount: eligible.filter((e) => isValidGps(e.asset.latitude, e.asset.longitude)).length,
+    mlTaggedCount: eligible.filter((e) => e.asset.smartTags.length > 0).length,
+    faceTaggedCount: eligible.filter((e) => e.asset.peopleIds.length > 0).length,
     unclusteredNoiseCount,
   };
 
@@ -645,6 +1127,7 @@ export function runFullPipeline(): {
   let sceneSplitsDetected = 0;
   let totalChaptersCreated = 0;
   const moodDistribution: Record<string, number> = {};
+  const signalUsage = { chroma: 0, immichMl: 0, gps: 0, faces: 0, exif: 0 };
   const eventTimelines: PipelineRunSummary['eventTimelines'] = [];
 
   const nextClusters: Array<{
@@ -663,6 +1146,7 @@ export function runFullPipeline(): {
     palette: PaletteSwatch[];
     avgLab: LabMean;
     emdBoundaryScore: number;
+    signalBreakdown: ClusterSignalBreakdown;
     status: ClusterRecord['status'];
     immichAlbumId: string | null;
     syncedAssetCount: number;
@@ -676,10 +1160,17 @@ export function runFullPipeline(): {
     const photos = evt.assets;
     const points: EmdTimelinePoint[] = [];
     const splitIndices: number[] = [];
+    const gpsScaleKm = evt.type === 'trip' ? 1.5 : 0.45;
 
     for (let i = 0; i < photos.length; i++) {
       let emdScore = 0;
+      let compositeScore = 0;
+      let gpsShift = 0;
+      let semanticShift = 0;
+      let peopleShift = 0;
+      let exifShift = 0;
       let gapMinutes = 0;
+      const activeSplitSignals: string[] = [];
 
       if (i > 0) {
         gapMinutes = Number(
@@ -687,13 +1178,59 @@ export function runFullPipeline(): {
         );
         const beforeStart = Math.max(0, i - windowSize);
         const afterEnd = Math.min(photos.length, i + windowSize);
-        const hBefore = averageHistograms(
-          photos.slice(beforeStart, i).map((p) => p.histogram)
-        );
-        const hAfter = averageHistograms(
-          photos.slice(i, afterEnd).map((p) => p.histogram)
-        );
+        const beforeSlice = photos.slice(beforeStart, i);
+        const afterSlice = photos.slice(i, afterEnd);
+
+        // 1. CIELAB Chroma EMD (always active, weight 0.45)
+        const hBefore = averageHistograms(beforeSlice.map((p) => p.histogram));
+        const hAfter = averageHistograms(afterSlice.map((p) => p.histogram));
         emdScore = computeLabHistogramEmd(hBefore, hAfter);
+
+        let weightedScore = emdScore * 0.45;
+        let totalWeight = 0.45;
+        if (emdScore >= settings.emdThreshold * 0.85) activeSplitSignals.push('Chroma');
+
+        // 2. Immich ML CLIP Semantic Shift (when tags exist in either window, weight 0.22)
+        const tagsBefore = new Set(beforeSlice.flatMap((p) => p.asset.smartTags));
+        const tagsAfter = new Set(afterSlice.flatMap((p) => p.asset.smartTags));
+        if (tagsBefore.size > 0 || tagsAfter.size > 0) {
+          semanticShift = Number((1 - jaccardSimilarity(tagsBefore, tagsAfter)).toFixed(3));
+          weightedScore += semanticShift * 0.22;
+          totalWeight += 0.22;
+          if (semanticShift >= 0.65) activeSplitSignals.push('Immich ML');
+        }
+
+        // 3. GPS Micro-Venue Shift (when both windows have valid GPS centroids, weight 0.18)
+        const cBefore = computeGpsCentroid(beforeSlice);
+        const cAfter = computeGpsCentroid(afterSlice);
+        if (cBefore && cAfter) {
+          const distKm = haversineKm(cBefore.lat, cBefore.lng, cAfter.lat, cAfter.lng);
+          gpsShift = Number(Math.min(1, distKm / gpsScaleKm).toFixed(3));
+          weightedScore += gpsShift * 0.18;
+          totalWeight += 0.18;
+          if (gpsShift >= 0.5) activeSplitSignals.push('GPS');
+        }
+
+        // 4. Immich Facial Recognition Cohort Shift (when faces appear on both sides, weight 0.08)
+        const peopleBefore = new Set(beforeSlice.flatMap((p) => p.asset.peopleIds));
+        const peopleAfter = new Set(afterSlice.flatMap((p) => p.asset.peopleIds));
+        if (peopleBefore.size > 0 && peopleAfter.size > 0) {
+          peopleShift = Number((1 - jaccardSimilarity(peopleBefore, peopleAfter)).toFixed(3));
+          weightedScore += peopleShift * 0.08;
+          totalWeight += 0.08;
+          if (peopleShift >= 0.6) activeSplitSignals.push('Faces');
+        }
+
+        // 5. EXIF Lighting / Camera Regime Shift (ISO + camera/lens, weight 0.07)
+        const rawExifShift = computeExifLightingShift(beforeSlice, afterSlice);
+        if (rawExifShift !== null) {
+          exifShift = rawExifShift;
+          weightedScore += exifShift * 0.07;
+          totalWeight += 0.07;
+          if (exifShift >= 0.5) activeSplitSignals.push('EXIF');
+        }
+
+        compositeScore = Number((weightedScore / totalWeight).toFixed(3));
       }
 
       const lastSplit = splitIndices.length > 0 ? splitIndices[splitIndices.length - 1] : 0;
@@ -704,12 +1241,17 @@ export function runFullPipeline(): {
         i > 0 &&
         enoughBefore &&
         enoughAfter &&
-        emdScore >= settings.emdThreshold &&
+        compositeScore >= settings.emdThreshold &&
         gapMinutes >= settings.sceneSplitGapMins;
 
       if (isSplitBoundary) {
         splitIndices.push(i);
         sceneSplitsDetected++;
+        if (activeSplitSignals.includes('Chroma') || activeSplitSignals.length === 0) signalUsage.chroma++;
+        if (activeSplitSignals.includes('Immich ML')) signalUsage.immichMl++;
+        if (activeSplitSignals.includes('GPS')) signalUsage.gps++;
+        if (activeSplitSignals.includes('Faces')) signalUsage.faces++;
+        if (activeSplitSignals.includes('EXIF')) signalUsage.exif++;
       }
 
       points.push({
@@ -718,6 +1260,16 @@ export function runFullPipeline(): {
         fileName: photos[i].asset.fileName,
         timestamp: photos[i].asset.localDateTime,
         emdScore,
+        compositeScore,
+        gpsShift,
+        semanticShift,
+        peopleShift,
+        exifShift,
+        splitSignals: isSplitBoundary
+          ? activeSplitSignals.length > 0
+            ? activeSplitSignals
+            : ['Chroma']
+          : [],
         gapMinutes,
         labL: photos[i].avgLab.l,
         labB: photos[i].avgLab.b,
@@ -732,13 +1284,19 @@ export function runFullPipeline(): {
     for (const splitIdx of splitIndices) {
       slices.push({
         items: photos.slice(cursor, splitIdx),
-        boundaryEmd: cursor === 0 ? 0 : points[cursor]?.emdScore || 0,
+        boundaryEmd:
+          cursor === 0
+            ? 0
+            : points[cursor]?.compositeScore ?? points[cursor]?.emdScore ?? 0,
       });
       cursor = splitIdx;
     }
     slices.push({
       items: photos.slice(cursor),
-      boundaryEmd: cursor === 0 ? 0 : points[cursor]?.emdScore || 0,
+      boundaryEmd:
+        cursor === 0
+          ? 0
+          : points[cursor]?.compositeScore ?? points[cursor]?.emdScore ?? 0,
     });
 
     const hasSubChapters = slices.length > 1;
@@ -746,6 +1304,7 @@ export function runFullPipeline(): {
     const masterPalette = mergePalettesToFive(photos.map((p) => p.palette));
     const masterMood = classifyAestheticMood(masterAvgLab, masterPalette);
     const masterOccasion = pickTopOccasion(photos);
+    const masterSignals = buildClusterSignalBreakdown(photos);
 
     eventTimelines.push({
       eventId: evt.id,
@@ -794,7 +1353,8 @@ export function runFullPipeline(): {
         endDate: photos[photos.length - 1].asset.localDateTime,
         palette: masterPalette,
         avgLab: masterAvgLab,
-        emdBoundaryScore: Math.max(...points.map((p) => p.emdScore), 0),
+        emdBoundaryScore: Math.max(...points.map((p) => p.compositeScore ?? p.emdScore), 0),
+        signalBreakdown: masterSignals,
         status:
           prev?.status === 'discarded'
             ? 'discarded'
@@ -810,7 +1370,7 @@ export function runFullPipeline(): {
       });
     }
 
-    // Color-Tone / Theme Sub-Chapter Albums (overlapping multi-album assignment!)
+    // Multi-Signal Theme & Color-Tone Sub-Chapter Albums
     if (hasSubChapters) {
       slices.forEach((slice, idx) => {
         totalChaptersCreated++;
@@ -818,6 +1378,7 @@ export function runFullPipeline(): {
         const palette = mergePalettesToFive(slice.items.map((p) => p.palette));
         const mood = classifyAestheticMood(avgLab, palette);
         const occasion = pickTopOccasion(slice.items);
+        const chapterSignals = buildClusterSignalBreakdown(slice.items);
         const chapterSubtitle =
           occasion && occasion.toLowerCase() !== mood.toLowerCase()
             ? `${occasion} & ${mood}`
@@ -862,6 +1423,7 @@ export function runFullPipeline(): {
           palette,
           avgLab,
           emdBoundaryScore: slice.boundaryEmd,
+          signalBreakdown: chapterSignals,
           status:
             prev?.status === 'discarded'
               ? 'discarded'
@@ -886,12 +1448,12 @@ export function runFullPipeline(): {
       id, cluster_hash, parent_event_id, parent_event_name, cluster_type,
       title, proposed_title, location_label, mood_label, occasion_label,
       start_date, end_date, palette_json, avg_lab_json, emd_boundary_score,
-      status, immich_album_id, synced_asset_count, asset_ids_json, emd_series_json, updated_at
+      signal_breakdown_json, status, immich_album_id, synced_asset_count, asset_ids_json, emd_series_json, updated_at
     ) VALUES (
       @id, @cluster_hash, @parent_event_id, @parent_event_name, @cluster_type,
       @title, @proposed_title, @location_label, @mood_label, @occasion_label,
       @start_date, @end_date, @palette_json, @avg_lab_json, @emd_boundary_score,
-      @status, @immich_album_id, @synced_asset_count, @asset_ids_json, @emd_series_json, @updated_at
+      @signal_breakdown_json, @status, @immich_album_id, @synced_asset_count, @asset_ids_json, @emd_series_json, @updated_at
     )
   `);
 
@@ -914,6 +1476,7 @@ export function runFullPipeline(): {
         palette_json: JSON.stringify(c.palette),
         avg_lab_json: JSON.stringify(c.avgLab),
         emd_boundary_score: c.emdBoundaryScore,
+        signal_breakdown_json: JSON.stringify(c.signalBreakdown),
         status: c.status,
         immich_album_id: c.immichAlbumId,
         synced_asset_count: c.syncedAssetCount,
@@ -929,6 +1492,7 @@ export function runFullPipeline(): {
     sceneSplitsDetected,
     totalChaptersCreated,
     moodDistribution,
+    signalUsage,
   };
 
   const summary: PipelineRunSummary = {

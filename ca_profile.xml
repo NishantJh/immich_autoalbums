@@ -2,7 +2,7 @@
 <Maintainer>
   <Icon>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.png</Icon>
   <Profile>
-    Self-hosted media automation and Immich companion tools maintained by NishantJh. Focused on privacy-first local photo analysis, perceptual CIELAB color-tone scene splitting, and reliable Docker deployments for Unraid home servers.
+    Self-hosted media automation and Immich companion tools maintained by NishantJh. Focused on smart album creation using advanced feature analysis — fusing GPS, Immich ML, perceptual CIELAB chroma, and EXIF metadata — with privacy-first local Docker deployments for Unraid home servers.
   </Profile>
   <WebPage>https://github.com/NishantJh/immich_autoalbums</WebPage>
 </Maintainer>

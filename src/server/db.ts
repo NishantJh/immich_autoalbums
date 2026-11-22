@@ -30,8 +30,14 @@ export const DEFAULT_SETTINGS: OrganizerSettings = {
   useStructuredPrefix: true,
   createMasterAlbum: true,
   createMoodSubalbums: true,
+  ignoreScreenshots: true,
   excludedPaths: ['WhatsApp', 'Downloads', 'Screenshots'],
+  homeBaseMode: 'auto',
+  homeBaseCityOverride: '',
+  homeBaseLatOverride: null,
+  homeBaseLngOverride: null,
   scanIntervalHours: 6,
+  maxAssetsPerPull: 0,
   lastScanAt: null,
 };
 
@@ -129,6 +135,29 @@ export function getDb(): Database.Database {
     );
   `);
 
+  // Idempotent schema migrations for existing SQLite databases
+  const assetCols = new Set(
+    (db.prepare('PRAGMA table_info(assets)').all() as Array<{ name: string }>).map((c) => c.name)
+  );
+  const assetMigrations: Array<[string, string]> = [
+    ['state', 'ALTER TABLE assets ADD COLUMN state TEXT'],
+    ['lens_model', 'ALTER TABLE assets ADD COLUMN lens_model TEXT'],
+    ['focal_length', 'ALTER TABLE assets ADD COLUMN focal_length REAL'],
+    ['iso', 'ALTER TABLE assets ADD COLUMN iso INTEGER'],
+    ['is_favorite', 'ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0'],
+    ['people_names_json', "ALTER TABLE assets ADD COLUMN people_names_json TEXT NOT NULL DEFAULT '[]'"],
+  ];
+  for (const [col, sql] of assetMigrations) {
+    if (!assetCols.has(col)) db.exec(sql);
+  }
+
+  const clusterCols = new Set(
+    (db.prepare('PRAGMA table_info(clusters)').all() as Array<{ name: string }>).map((c) => c.name)
+  );
+  if (!clusterCols.has('signal_breakdown_json')) {
+    db.exec('ALTER TABLE clusters ADD COLUMN signal_breakdown_json TEXT');
+  }
+
   // Initialize default settings if absent
   const existingSettings = db
     .prepare('SELECT value_json FROM app_state WHERE key = ?')
@@ -186,14 +215,45 @@ export function saveSettings(partial: Partial<OrganizerSettings>): OrganizerSett
     createMoodSubalbums: Boolean(
       partial.createMoodSubalbums ?? current.createMoodSubalbums
     ),
+    ignoreScreenshots: Boolean(
+      partial.ignoreScreenshots ?? current.ignoreScreenshots
+    ),
     excludedPaths: Array.isArray(partial.excludedPaths)
       ? partial.excludedPaths
           .map((s) => String(s).trim())
           .filter(Boolean)
           .slice(0, 30)
       : current.excludedPaths,
+    homeBaseMode:
+      partial.homeBaseMode === 'auto' ||
+      partial.homeBaseMode === 'manual' ||
+      partial.homeBaseMode === 'disabled'
+        ? partial.homeBaseMode
+        : current.homeBaseMode,
+    homeBaseCityOverride: String(
+      partial.homeBaseCityOverride ?? current.homeBaseCityOverride
+    )
+      .trim()
+      .slice(0, 80),
+    homeBaseLatOverride:
+      partial.homeBaseLatOverride === null
+        ? null
+        : typeof partial.homeBaseLatOverride === 'number' &&
+            Number.isFinite(partial.homeBaseLatOverride)
+          ? clampNum(partial.homeBaseLatOverride, -90, 90)
+          : current.homeBaseLatOverride,
+    homeBaseLngOverride:
+      partial.homeBaseLngOverride === null
+        ? null
+        : typeof partial.homeBaseLngOverride === 'number' &&
+            Number.isFinite(partial.homeBaseLngOverride)
+          ? clampNum(partial.homeBaseLngOverride, -180, 180)
+          : current.homeBaseLngOverride,
     scanIntervalHours: Math.round(
       clampNum(partial.scanIntervalHours ?? current.scanIntervalHours, 1, 168)
+    ),
+    maxAssetsPerPull: Math.round(
+      clampNum(partial.maxAssetsPerPull ?? current.maxAssetsPerPull, 0, 100000)
     ),
     lastScanAt:
       partial.lastScanAt !== undefined ? partial.lastScanAt : current.lastScanAt,
@@ -220,11 +280,16 @@ export interface DbAssetRow {
   original_path: string;
   local_date_time: string;
   city: string | null;
+  state?: string | null;
   country: string | null;
   latitude: number | null;
   longitude: number | null;
   exif_make: string | null;
   exif_model: string | null;
+  lens_model?: string | null;
+  focal_length?: number | null;
+  iso?: number | null;
+  is_favorite?: number;
   width: number;
   height: number;
   is_archived: number;
@@ -233,6 +298,7 @@ export interface DbAssetRow {
   is_screenshot: number;
   excluded_reason: string | null;
   people_ids_json: string;
+  people_names_json?: string;
   smart_tags_json: string;
   thumbnail_file: string | null;
   lab_l: number | null;
@@ -253,11 +319,16 @@ export function rowToAsset(row: DbAssetRow): AssetRecord {
     originalPath: row.original_path,
     localDateTime: row.local_date_time,
     city: row.city,
+    state: row.state ?? null,
     country: row.country,
     latitude: row.latitude,
     longitude: row.longitude,
     exifMake: row.exif_make,
     exifModel: row.exif_model,
+    lensModel: row.lens_model ?? null,
+    focalLength: typeof row.focal_length === 'number' ? row.focal_length : null,
+    iso: typeof row.iso === 'number' ? row.iso : null,
+    isFavorite: Boolean(row.is_favorite),
     width: row.width,
     height: row.height,
     isArchived: Boolean(row.is_archived),
@@ -266,6 +337,7 @@ export function rowToAsset(row: DbAssetRow): AssetRecord {
     isScreenshot: Boolean(row.is_screenshot),
     excludedReason: row.excluded_reason,
     peopleIds: JSON.parse(row.people_ids_json || '[]'),
+    peopleNames: JSON.parse(row.people_names_json || '[]'),
     smartTags: JSON.parse(row.smart_tags_json || '[]'),
     thumbnailUrl: `/api/assets/${encodeURIComponent(row.id)}/thumbnail`,
     avgLab: hasLab
@@ -339,6 +411,7 @@ export function getAllClusters(includeAssets = true): ClusterRecord[] {
     palette_json: string;
     avg_lab_json: string;
     emd_boundary_score: number;
+    signal_breakdown_json?: string | null;
     status: ClusterRecord['status'];
     immich_album_id: string | null;
     synced_asset_count: number;
@@ -372,6 +445,9 @@ export function getAllClusters(includeAssets = true): ClusterRecord[] {
       palette: JSON.parse(r.palette_json || '[]') as PaletteSwatch[],
       avgLab: JSON.parse(r.avg_lab_json) as LabMean,
       emdBoundaryScore: r.emd_boundary_score,
+      signalBreakdown: r.signal_breakdown_json
+        ? JSON.parse(r.signal_breakdown_json)
+        : undefined,
       status: r.status,
       immichAlbumId: r.immich_album_id,
       syncedAssetCount: r.synced_asset_count,
