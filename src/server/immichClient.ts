@@ -61,6 +61,22 @@ function decryptSecret(payload: { iv: string; tag: string; ciphertext: string })
   }
 }
 
+export function normalizeApiKey(raw: string): string {
+  let clean = String(raw || '')
+    .replace(/[\r\n\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+  // Strip accidental pasted header prefixes (e.g. "x-api-key: ..." or "Bearer ...")
+  clean = clean.replace(/^(?:x-api-key\s*:\s*|bearer\s+)/i, '').trim();
+  // Strip accidental surrounding quotes from .env or Unraid template copy-paste
+  if (
+    (clean.startsWith('"') && clean.endsWith('"')) ||
+    (clean.startsWith("'") && clean.endsWith("'"))
+  ) {
+    clean = clean.slice(1, -1).trim();
+  }
+  return clean;
+}
+
 export function validateImmichUrl(rawUrl: string): { baseUrl: string; hostLabel: string } {
   const trimmed = rawUrl.trim().replace(/\/+$/, '');
   if (!trimmed) {
@@ -83,17 +99,23 @@ export function validateImmichUrl(rawUrl: string): { baseUrl: string; hostLabel:
   ) {
     throw new Error('Blocked metadata host address.');
   }
+  // Strip trailing slashes and an optional trailing "/api" so both
+  // "http://host:2283" and "http://host:2283/api" resolve cleanly.
+  const normalizedPath = parsed.pathname.replace(/\/+$/, '').replace(/\/api$/i, '');
   return {
-    baseUrl: `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, ''),
+    baseUrl: `${parsed.origin}${normalizedPath}`.replace(/\/+$/, ''),
     hostLabel: parsed.host,
   };
 }
 
 function maskKey(apiKey: string): string {
-  const clean = apiKey.trim();
+  const clean = normalizeApiKey(apiKey);
   if (clean.length <= 4) return '••••';
   return `••••••••${clean.slice(-4)}`;
 }
+
+// Tracks whether a given Immich baseUrl requires ?apiKey= fallback because a reverse proxy strips x-api-key
+const hostAuthModeCache = new Map<string, 'header' | 'query'>();
 
 function getSavedImmichConfig(): { baseUrl: string; apiKey: string; hostLabel: string } | null {
   const row = getDb()
@@ -103,13 +125,19 @@ function getSavedImmichConfig(): { baseUrl: string; apiKey: string; hostLabel: s
 
   try {
     const stored = JSON.parse(row.value_json) as StoredImmichConfig;
-    const apiKey = decryptSecret(stored);
+    const rawKey = decryptSecret(stored);
+    if (!rawKey) return null;
+    const apiKey = normalizeApiKey(rawKey);
     if (!apiKey) return null;
     const { baseUrl, hostLabel } = validateImmichUrl(stored.baseUrl);
     return { baseUrl, apiKey, hostLabel };
   } catch {
     return null;
   }
+}
+
+export function getActiveImmichKey(): string | null {
+  return getConfiguredImmich()?.apiKey || null;
 }
 
 function getConfiguredImmich(): {
@@ -123,8 +151,8 @@ function getConfiguredImmich(): {
     return { ...saved, source: 'saved' };
   }
 
-  const rawUrl = (process.env.IMMICH_URL || '').trim().replace(/\/+$/, '');
-  const apiKey = (process.env.IMMICH_API_KEY || '').trim();
+  const rawUrl = (process.env.IMMICH_URL || '').trim();
+  const apiKey = normalizeApiKey(process.env.IMMICH_API_KEY || '');
   if (!rawUrl || !apiKey) return null;
 
   try {
@@ -135,32 +163,140 @@ function getConfiguredImmich(): {
   }
 }
 
+async function readImmichErrorDetail(res: Response): Promise<{
+  isJson: boolean;
+  message: string | null;
+}> {
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  const raw = await res.text().catch(() => '');
+  if (contentType.includes('application/json') || raw.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw) as { message?: string | string[]; error?: string };
+      const msg = Array.isArray(parsed.message)
+        ? parsed.message.join(', ')
+        : parsed.message || parsed.error || null;
+      return { isJson: true, message: msg ? String(msg).slice(0, 180) : null };
+    } catch {
+      return { isJson: false, message: raw.slice(0, 140) || null };
+    }
+  }
+  return { isJson: false, message: null };
+}
+
 export async function probeImmichConnection(
-  baseUrl: string,
-  apiKey: string
+  rawBaseUrl: string,
+  rawApiKey: string
 ): Promise<{ reachable: boolean; serverVersion: string | null; lastError: string | null }> {
+  const { baseUrl } = validateImmichUrl(rawBaseUrl);
+  const apiKey = normalizeApiKey(rawApiKey);
+  if (!apiKey) {
+    return {
+      reachable: false,
+      serverVersion: null,
+      lastError: 'Immich API key is empty.',
+    };
+  }
+
   try {
-    const res = await fetch(`${baseUrl}/api/server/version`, {
+    // 1. Check basic Immich reachability & version via public /api/server/version (no auth header)
+    let versionStr = 'connected';
+    let effectiveBaseUrl = baseUrl;
+    let redirectHint = '';
+
+    const verRes = await fetch(`${baseUrl}/api/server/version`, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (verRes.redirected && verRes.url) {
+      try {
+        const redirected = new URL(verRes.url);
+        const orig = new URL(baseUrl);
+        if (redirected.origin !== orig.origin) {
+          effectiveBaseUrl = redirected.origin;
+          redirectHint = ` (redirected from ${orig.origin} to ${redirected.origin} — use ${redirected.origin} directly)`;
+        }
+      } catch {
+        // Ignore malformed redirect URL
+      }
+    }
+
+    if (verRes.ok) {
+      const ct = (verRes.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('application/json')) {
+        const ver = (await verRes.json().catch(() => ({}))) as {
+          major?: number;
+          minor?: number;
+          patch?: number;
+        };
+        if (typeof ver.major === 'number') {
+          versionStr = `v${ver.major}.${ver.minor ?? 0}.${ver.patch ?? 0}`;
+        }
+      } else {
+        return {
+          reachable: false,
+          serverVersion: null,
+          lastError: `Server at ${baseUrl} returned HTML instead of Immich JSON (check URL or reverse proxy auth).`,
+        };
+      }
+    }
+
+    // 2. Validate API key against GET /api/albums (only requires album.read or all)
+    const headerRes = await fetch(`${effectiveBaseUrl}/api/albums`, {
       headers: {
         'x-api-key': apiKey,
         Accept: 'application/json',
       },
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) {
+
+    if (headerRes.ok) {
+      hostAuthModeCache.set(baseUrl, 'header');
+      return { reachable: true, serverVersion: versionStr, lastError: null };
+    }
+
+    const detail = await readImmichErrorDetail(headerRes);
+
+    // 3. If header auth returned 401/403, test Immich's native ?apiKey= query parameter
+    //    to detect reverse proxies (Nginx/Cloudflare/Traefik) stripping custom x-api-key headers
+    if (headerRes.status === 401 || headerRes.status === 403) {
+      const queryRes = await fetch(
+        `${effectiveBaseUrl}/api/albums?apiKey=${encodeURIComponent(apiKey)}`,
+        {
+          headers: { Accept: 'application/json' },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (queryRes.ok) {
+        hostAuthModeCache.set(baseUrl, 'query');
+        return {
+          reachable: true,
+          serverVersion: `${versionStr} (via query auth)`,
+          lastError: null,
+        };
+      }
+
+      if (!detail.isJson) {
+        return {
+          reachable: false,
+          serverVersion: null,
+          lastError: `Reverse proxy returned HTTP ${headerRes.status} before reaching Immich${redirectHint}. Try your direct LAN URL (e.g. http://192.168.x.x:2283).`,
+        };
+      }
+
+      const reason = detail.message || 'Invalid API key';
       return {
         reachable: false,
         serverVersion: null,
-        lastError:
-          res.status === 401 || res.status === 403
-            ? 'Immich rejected the API key (HTTP 401/403).'
-            : `HTTP ${res.status} from Immich server`,
+        lastError: `Immich HTTP ${headerRes.status}: ${reason} (key ending ${maskKey(apiKey)})${redirectHint}. Ensure this key is active in Immich Account Settings -> API Keys with asset.read, asset.view, album.read, album.create, albumAsset.create (or All).`,
       };
     }
-    const ver = (await res.json()) as { major?: number; minor?: number; patch?: number };
-    const versionStr =
-      typeof ver.major === 'number' ? `v${ver.major}.${ver.minor ?? 0}.${ver.patch ?? 0}` : 'connected';
-    return { reachable: true, serverVersion: versionStr, lastError: null };
+
+    return {
+      reachable: false,
+      serverVersion: null,
+      lastError: `HTTP ${headerRes.status} from ${effectiveBaseUrl}/api/albums${detail.message ? `: ${detail.message}` : ''}${redirectHint}`,
+    };
   } catch (err) {
     return {
       reachable: false,
@@ -176,7 +312,7 @@ export async function saveImmichConnection(
 ): Promise<ImmichStatus> {
   const { baseUrl } = validateImmichUrl(rawUrl);
   const existing = getConfiguredImmich();
-  const apiKey = (rawApiKey || '').trim() || existing?.apiKey || '';
+  const apiKey = normalizeApiKey(rawApiKey || '') || existing?.apiKey || '';
   if (!apiKey) {
     throw new Error('Immich API key is required.');
   }
@@ -194,11 +330,13 @@ export async function saveImmichConnection(
     )
     .run('immich_connection', JSON.stringify(payload));
 
+  hostAuthModeCache.delete(baseUrl);
   return checkImmichStatus();
 }
 
 export async function clearSavedImmichConnection(): Promise<ImmichStatus> {
   getDb().prepare('DELETE FROM app_state WHERE key = ?').run('immich_connection');
+  hostAuthModeCache.clear();
   return checkImmichStatus();
 }
 
@@ -211,10 +349,17 @@ async function immichFetch(apiPath: string, init: RequestInit = {}): Promise<Res
   const normalizedPath = apiPath.startsWith('/api/')
     ? apiPath
     : `/api/${apiPath.replace(/^\/+/, '')}`;
-  const targetUrl = `${cfg.baseUrl}${normalizedPath}`;
+  const authMode = hostAuthModeCache.get(cfg.baseUrl) || 'header';
+  const separator = normalizedPath.includes('?') ? '&' : '?';
+  const targetUrl =
+    authMode === 'query'
+      ? `${cfg.baseUrl}${normalizedPath}${separator}apiKey=${encodeURIComponent(cfg.apiKey)}`
+      : `${cfg.baseUrl}${normalizedPath}`;
 
   const headers = new Headers(init.headers || {});
-  headers.set('x-api-key', cfg.apiKey);
+  if (authMode === 'header') {
+    headers.set('x-api-key', cfg.apiKey);
+  }
   if (!headers.has('Accept')) {
     headers.set('Accept', 'application/json');
   }

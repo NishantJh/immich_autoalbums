@@ -1,77 +1,17 @@
-import { Check, Copy, Download, ExternalLink, FileCode2, Save } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Loader2, RotateCcw, Save, Sliders } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import type { OrganizerSettings } from '../shared/types.ts';
-
-interface DeployBundle {
-  repoUrl: string;
-  imageRef: string;
-  files: {
-    unraidXml: string;
-    caProfileXml: string;
-    dockerCompose: string;
-    dockerfile: string;
-    githubWorkflow: string;
-    license: string;
-    configYaml: string;
-  };
-}
 
 interface RulesDeployViewProps {
   settings: OrganizerSettings;
   isBusy: boolean;
   onSaveSettings: (payload: {
     settings?: Partial<OrganizerSettings>;
-    yaml?: string;
     rerun: boolean;
   }) => Promise<void>;
 }
 
-type BundleTab =
-  | 'unraidXml'
-  | 'caProfileXml'
-  | 'dockerCompose'
-  | 'dockerfile'
-  | 'githubWorkflow'
-  | 'license'
-  | 'configYaml';
-
-const BUNDLE_META: Record<BundleTab, { label: string; fileName: string; mime: string }> = {
-  unraidXml: {
-    label: 'Unraid CA XML',
-    fileName: 'immich-autoalbums.xml',
-    mime: 'application/xml',
-  },
-  caProfileXml: {
-    label: 'ca_profile.xml',
-    fileName: 'ca_profile.xml',
-    mime: 'application/xml',
-  },
-  dockerCompose: {
-    label: 'docker-compose.yml',
-    fileName: 'docker-compose.yml',
-    mime: 'text/yaml',
-  },
-  dockerfile: {
-    label: 'Dockerfile',
-    fileName: 'Dockerfile',
-    mime: 'text/plain',
-  },
-  githubWorkflow: {
-    label: 'GHCR Action',
-    fileName: 'docker-publish.yml',
-    mime: 'text/yaml',
-  },
-  license: {
-    label: 'LICENSE',
-    fileName: 'LICENSE',
-    mime: 'text/plain',
-  },
-  configYaml: {
-    label: 'config.yaml',
-    fileName: 'config.yaml',
-    mime: 'text/yaml',
-  },
-};
+const DEFAULT_EXCLUDED_PATHS = ['WhatsApp', 'Screenshots', 'Downloads', 'Memes', 'Telegram'];
 
 export function RulesDeployView({
   settings,
@@ -84,26 +24,6 @@ export function RulesDeployView({
   const [createMoodSubalbums, setCreateMoodSubalbums] = useState(settings.createMoodSubalbums);
   const [scanIntervalHours, setScanIntervalHours] = useState(settings.scanIntervalHours);
   const [excludedPathsText, setExcludedPathsText] = useState(settings.excludedPaths.join(', '));
-  const [yamlText, setYamlText] = useState('');
-  const [yamlError, setYamlError] = useState<string | null>(null);
-  const [bundle, setBundle] = useState<DeployBundle | null>(null);
-  const [activeTab, setActiveTab] = useState<BundleTab>('unraidXml');
-  const [copied, setCopied] = useState(false);
-
-  const loadConfigAndBundle = async () => {
-    const [settingsRes, bundleRes] = await Promise.all([
-      fetch('/api/settings'),
-      fetch('/api/deploy/bundle'),
-    ]);
-    if (settingsRes.ok) {
-      const data = (await settingsRes.json()) as { yaml: string };
-      setYamlText(data.yaml);
-    }
-    if (bundleRes.ok) {
-      const data = (await bundleRes.json()) as DeployBundle;
-      setBundle(data);
-    }
-  };
 
   useEffect(() => {
     setTitlePrefix(settings.titlePrefix);
@@ -112,340 +32,276 @@ export function RulesDeployView({
     setCreateMoodSubalbums(settings.createMoodSubalbums);
     setScanIntervalHours(settings.scanIntervalHours);
     setExcludedPathsText(settings.excludedPaths.join(', '));
-    void loadConfigAndBundle();
   }, [settings]);
 
+  const parsedPaths = useMemo(
+    () =>
+      excludedPathsText
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    [excludedPathsText]
+  );
+
+  const isDirty = useMemo(() => {
+    return (
+      titlePrefix !== settings.titlePrefix ||
+      useStructuredPrefix !== settings.useStructuredPrefix ||
+      createMasterAlbum !== settings.createMasterAlbum ||
+      createMoodSubalbums !== settings.createMoodSubalbums ||
+      scanIntervalHours !== settings.scanIntervalHours ||
+      parsedPaths.join(',') !== settings.excludedPaths.join(',')
+    );
+  }, [
+    titlePrefix,
+    useStructuredPrefix,
+    createMasterAlbum,
+    createMoodSubalbums,
+    scanIntervalHours,
+    parsedPaths,
+    settings,
+  ]);
+
+  const previewTitles = useMemo(() => {
+    const prefix = titlePrefix.trim() ? `${titlePrefix.trim()} ` : '';
+    const master = useStructuredPrefix
+      ? `${prefix}2026-08 • Kyoto Trip (All)`
+      : `${prefix}Kyoto Trip`;
+    const chapter1 = useStructuredPrefix
+      ? `${prefix}2026-08 • Kyoto Trip — Golden Hour`
+      : `${prefix}Kyoto Trip — Golden Hour`;
+    const chapter2 = useStructuredPrefix
+      ? `${prefix}2026-08 • Kyoto Trip — Night Neon`
+      : `${prefix}Kyoto Trip — Night Neon`;
+    return { master, chapter1, chapter2 };
+  }, [titlePrefix, useStructuredPrefix]);
+
   const handleSaveForm = async () => {
-    setYamlError(null);
-    const paths = excludedPathsText
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
     await onSaveSettings({
       settings: {
         titlePrefix,
         useStructuredPrefix,
         createMasterAlbum,
         createMoodSubalbums,
-        scanIntervalHours,
-        excludedPaths: paths,
+        scanIntervalHours: Math.max(1, Math.min(168, Number(scanIntervalHours) || 6)),
+        excludedPaths: parsedPaths,
       },
       rerun: true,
     });
-    await loadConfigAndBundle();
   };
 
-  const handleSaveYaml = async () => {
-    setYamlError(null);
-    try {
-      await onSaveSettings({ yaml: yamlText, rerun: true });
-      await loadConfigAndBundle();
-    } catch (err) {
-      setYamlError(err instanceof Error ? err.message : 'Invalid YAML syntax');
-    }
-  };
-
-  const currentBundleContent = bundle ? bundle.files[activeTab] : '';
-
-  const handleCopy = async () => {
-    if (!currentBundleContent) return;
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(currentBundleContent);
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = currentBundleContent;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-      }
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1800);
-    } catch {
-      setCopied(false);
-    }
-  };
-
-  const handleDownload = () => {
-    if (!currentBundleContent) return;
-    const meta = BUNDLE_META[activeTab];
-    const blob = new Blob([currentBundleContent], { type: meta.mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = meta.fileName;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleResetDefaults = () => {
+    setTitlePrefix('');
+    setUseStructuredPrefix(true);
+    setCreateMasterAlbum(true);
+    setCreateMoodSubalbums(true);
+    setScanIntervalHours(6);
+    setExcludedPathsText(DEFAULT_EXCLUDED_PATHS.join(', '));
   };
 
   return (
-    <div className="space-y-6">
-      {/* Exclusion Rules & config.yaml Editor */}
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-2 items-stretch">
-        <section className="flex flex-col justify-between rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] p-6">
-          <div className="space-y-4">
-            <div>
-              <h2 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
-                Exclusion Rules &amp; Album Naming Safeguards
-              </h2>
-              <p className="text-xs text-neutral-500 dark:text-neutral-400">
-                Configure ignored folders, Immich flat-album prefixes, and periodic scan cadence.
-              </p>
-            </div>
+    <div className="grid grid-cols-1 gap-5 xl:grid-cols-3 items-start">
+      {/* Exclusion Rules & Album Naming Safeguards */}
+      <section className="xl:col-span-2 rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] overflow-hidden">
+        <div className="flex items-center gap-2.5 border-b border-zinc-200/80 dark:border-white/[0.07] px-6 py-4">
+          <Sliders className="h-4 w-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
+          <div>
+            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+              Exclusion Rules &amp; Album Naming Safeguards
+            </h2>
+            <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+              Settings are stored in SQLite and applied automatically on every scan.
+            </p>
+          </div>
+        </div>
 
-            <div className="space-y-3.5 pt-2">
-              <label className="block space-y-1">
-                <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
-                  Excluded source path keywords (comma-separated)
-                </span>
-                <input
-                  type="text"
-                  value={excludedPathsText}
-                  onChange={(e) => setExcludedPathsText(e.target.value)}
-                  className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#0B0E14] px-3 py-2 text-sm text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
-                />
-              </label>
+        <div className="p-6 space-y-5">
+          <label className="block space-y-1.5">
+            <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+              Excluded source path keywords (comma-separated)
+            </span>
+            <input
+              type="text"
+              value={excludedPathsText}
+              onChange={(e) => setExcludedPathsText(e.target.value)}
+              placeholder="WhatsApp, Screenshots, Downloads, Memes"
+              className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.09] bg-zinc-50/70 dark:bg-[#0A0C10] px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+            />
+            <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">
+              Assets whose file path contains any of these keywords are skipped during Stage 1 pre-filtering.
+            </span>
+          </label>
 
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <label className="block space-y-1">
-                  <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
-                    Optional album title prefix
-                  </span>
-                  <input
-                    type="text"
-                    value={titlePrefix}
-                    onChange={(e) => setTitlePrefix(e.target.value)}
-                    placeholder="e.g. [Auto]"
-                    className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#0B0E14] px-3 py-2 text-sm text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
-                  />
-                </label>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <label className="block space-y-1.5">
+              <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                Optional album title prefix
+              </span>
+              <input
+                type="text"
+                value={titlePrefix}
+                onChange={(e) => setTitlePrefix(e.target.value)}
+                placeholder="e.g. [Auto]"
+                className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.09] bg-zinc-50/70 dark:bg-[#0A0C10] px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+              />
+            </label>
 
-                <label className="block space-y-1">
-                  <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
-                    Scheduled scan interval (hours)
-                  </span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={168}
-                    value={scanIntervalHours}
-                    onChange={(e) => setScanIntervalHours(Number(e.target.value))}
-                    className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#0B0E14] px-3 py-2 text-sm font-mono tabular-nums text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
-                  />
-                </label>
-              </div>
-
-              <div className="space-y-2.5 pt-2">
-                <label className="flex items-start gap-2.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={useStructuredPrefix}
-                    onChange={(e) => setUseStructuredPrefix(e.target.checked)}
-                    className="mt-0.5 rounded border-neutral-300 accent-indigo-600"
-                  />
-                  <span className="text-xs text-neutral-700 dark:text-neutral-300">
-                    <strong className="font-medium text-neutral-900 dark:text-neutral-100">
-                      Structured Prefix Naming
-                    </strong>{' '}
-                    — format titles as <code className="font-mono">YYYY-MM • Event — Chapter</code> so flat Immich lists group chronologically.
-                  </span>
-                </label>
-
-                <label className="flex items-start gap-2.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={createMasterAlbum}
-                    onChange={(e) => setCreateMasterAlbum(e.target.checked)}
-                    className="mt-0.5 rounded border-neutral-300 accent-indigo-600"
-                  />
-                  <span className="text-xs text-neutral-700 dark:text-neutral-300">
-                    <strong className="font-medium text-neutral-900 dark:text-neutral-100">
-                      Create Master Event Album (All)
-                    </strong>{' '}
-                    — keep an overarching album containing all photos alongside visual sub-chapters.
-                  </span>
-                </label>
-
-                <label className="flex items-start gap-2.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={createMoodSubalbums}
-                    onChange={(e) => setCreateMoodSubalbums(e.target.checked)}
-                    className="mt-0.5 rounded border-neutral-300 accent-indigo-600"
-                  />
-                  <span className="text-xs text-neutral-700 dark:text-neutral-300">
-                    <strong className="font-medium text-neutral-900 dark:text-neutral-100">
-                      Color-Tone Sub-Chapter Splitting
-                    </strong>{' '}
-                    — split multi-scene events automatically via sliding-window CIELAB EMD.
-                  </span>
-                </label>
-              </div>
-            </div>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                Scheduled scan interval (hours)
+              </span>
+              <input
+                type="number"
+                min={1}
+                max={168}
+                value={scanIntervalHours}
+                onChange={(e) => setScanIntervalHours(Number(e.target.value))}
+                className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.09] bg-zinc-50/70 dark:bg-[#0A0C10] px-3 py-2 text-sm font-mono tabular-nums text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
+              />
+            </label>
           </div>
 
-          <div className="mt-6 pt-4 border-t border-neutral-100 dark:border-neutral-800/80 flex justify-end">
+          <div className="divide-y divide-zinc-100 dark:divide-white/[0.06] rounded-lg border border-zinc-200/80 dark:border-white/[0.07]">
+            <label className="flex items-start gap-3 p-3.5 cursor-pointer hover:bg-zinc-50/70 dark:hover:bg-white/[0.02] transition-colors">
+              <input
+                type="checkbox"
+                checked={useStructuredPrefix}
+                onChange={(e) => setUseStructuredPrefix(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-zinc-300 dark:border-zinc-700 accent-indigo-600"
+              />
+              <span className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                <strong className="block font-medium text-zinc-900 dark:text-zinc-100">
+                  Structured Prefix Naming
+                </strong>
+                Format titles as <code className="font-mono text-zinc-800 dark:text-zinc-200">YYYY-MM • Event — Chapter</code> so Immich&apos;s flat album list sorts chronologically.
+              </span>
+            </label>
+
+            <label className="flex items-start gap-3 p-3.5 cursor-pointer hover:bg-zinc-50/70 dark:hover:bg-white/[0.02] transition-colors">
+              <input
+                type="checkbox"
+                checked={createMasterAlbum}
+                onChange={(e) => setCreateMasterAlbum(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-zinc-300 dark:border-zinc-700 accent-indigo-600"
+              />
+              <span className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                <strong className="block font-medium text-zinc-900 dark:text-zinc-100">
+                  Create Master Event Album (All)
+                </strong>
+                Keep an overarching album containing all photos from an event alongside its visual sub-chapters.
+              </span>
+            </label>
+
+            <label className="flex items-start gap-3 p-3.5 cursor-pointer hover:bg-zinc-50/70 dark:hover:bg-white/[0.02] transition-colors">
+              <input
+                type="checkbox"
+                checked={createMoodSubalbums}
+                onChange={(e) => setCreateMoodSubalbums(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-zinc-300 dark:border-zinc-700 accent-indigo-600"
+              />
+              <span className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                <strong className="block font-medium text-zinc-900 dark:text-zinc-100">
+                  Color-Tone Sub-Chapter Splitting
+                </strong>
+                Split multi-scene events automatically when sliding-window CIELAB Earth Mover&apos;s Distance detects a lighting or palette shift.
+              </span>
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-zinc-100 dark:border-white/[0.06]">
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={handleResetDefaults}
+              className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-white/[0.05] hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Reset Defaults
+            </button>
+
             <button
               type="button"
               disabled={isBusy}
               onClick={handleSaveForm}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap shrink-0 transition-colors"
             >
-              <Save className="h-3.5 w-3.5" />
-              Save Rules &amp; Re-Run
+              {isBusy ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Save className="h-3.5 w-3.5" />
+              )}
+              {isBusy
+                ? 'Saving...'
+                : isDirty
+                  ? 'Save Rules & Re-Run'
+                  : 'Re-Apply Rules'}
             </button>
           </div>
-        </section>
+        </div>
+      </section>
 
-        {/* Live config.yaml Editor */}
-        <section className="flex flex-col justify-between rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] p-6">
-          <div className="flex-1 flex flex-col">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <h2 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
-                  Live config.yaml
-                </h2>
-                <p className="text-xs text-neutral-500 dark:text-neutral-400">
-                  Edit directly and apply to persist into SQLite and regenerate deployment manifests.
-                </p>
+      {/* Live Naming Preview Panel */}
+      <section className="rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] p-6 space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+            Immich Naming Preview
+          </h3>
+          <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+            How a multi-scene event will appear in Immich&apos;s album list under your current rules.
+          </p>
+        </div>
+
+        <div className="divide-y divide-zinc-100 dark:divide-white/[0.06] rounded-lg border border-zinc-200/80 dark:border-white/[0.07] bg-zinc-50/70 dark:bg-[#0D1017]">
+          {createMasterAlbum && (
+            <div className="px-3.5 py-2.5">
+              <div className="text-xs font-medium text-zinc-900 dark:text-zinc-100 truncate">
+                {previewTitles.master}
+              </div>
+              <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                Master event album
               </div>
             </div>
-
-            <textarea
-              value={yamlText}
-              onChange={(e) => setYamlText(e.target.value)}
-              spellCheck={false}
-              rows={14}
-              className="mt-3 flex-1 w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-[#0B0E14] p-3.5 font-mono text-xs leading-relaxed text-neutral-800 dark:text-neutral-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
-            />
-            {yamlError && (
-              <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{yamlError}</p>
-            )}
-          </div>
-
-          <div className="mt-4 pt-4 border-t border-neutral-100 dark:border-neutral-800/80 flex justify-end">
-            <button
-              type="button"
-              disabled={isBusy}
-              onClick={handleSaveYaml}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-4 py-2 text-xs font-medium text-neutral-800 dark:text-neutral-100 hover:bg-neutral-50 dark:hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap shrink-0"
-            >
-              Apply YAML &amp; Re-Run
-            </button>
-          </div>
-        </section>
-      </div>
-
-      {/* Unraid Community Applications & GitHub Release Kit */}
-      <section className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-neutral-200 dark:border-neutral-800 px-6 py-4">
-          <div className="flex items-center gap-2.5">
-            <FileCode2 className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
-            <div>
-              <h2 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
-                Unraid Community App &amp; Docker Release Kit
-              </h2>
-              <p className="text-xs text-neutral-500 dark:text-neutral-400">
-                Pre-wired for <span className="font-mono">NishantJh/immich_autoalbums</span> and{' '}
-                <span className="font-mono">ghcr.io/nishantjh/immich_autoalbums:latest</span>
-              </p>
+          )}
+          {createMoodSubalbums && (
+            <>
+              <div className="px-3.5 py-2.5">
+                <div className="text-xs font-medium text-zinc-900 dark:text-zinc-100 truncate">
+                  {previewTitles.chapter1}
+                </div>
+                <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Color-tone chapter
+                </div>
+              </div>
+              <div className="px-3.5 py-2.5">
+                <div className="text-xs font-medium text-zinc-900 dark:text-zinc-100 truncate">
+                  {previewTitles.chapter2}
+                </div>
+                <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Color-tone chapter
+                </div>
+              </div>
+            </>
+          )}
+          {!createMasterAlbum && !createMoodSubalbums && (
+            <div className="px-3.5 py-3 text-xs text-amber-700 dark:text-amber-400">
+              Enable at least one album output option on the left to generate albums.
             </div>
-          </div>
-
-          <a
-            href={bundle?.repoUrl || 'https://github.com/NishantJh/immich_autoalbums'}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline whitespace-nowrap shrink-0"
-          >
-            GitHub Repository
-            <ExternalLink className="h-3.5 w-3.5" />
-          </a>
+          )}
         </div>
 
-        {/* 4-Step Unraid Release Checklist */}
-        <div className="grid grid-cols-1 divide-y divide-neutral-200 dark:divide-neutral-800 border-b border-neutral-200 dark:border-neutral-800 md:grid-cols-4 md:divide-y-0 md:divide-x bg-neutral-50/50 dark:bg-neutral-900/30">
-          <div className="p-4">
-            <div className="text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              01. Push to GitHub
-            </div>
-            <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              Push this workspace to <code className="font-mono">NishantJh/immich_autoalbums</code> on the <code className="font-mono">main</code> branch.
-            </p>
+        <div className="pt-2 border-t border-zinc-100 dark:border-white/[0.06] text-xs text-zinc-500 dark:text-zinc-400 space-y-1">
+          <div className="flex justify-between">
+            <span>Excluded keywords</span>
+            <span className="font-mono tabular-nums text-zinc-800 dark:text-zinc-200">
+              {parsedPaths.length}
+            </span>
           </div>
-          <div className="p-4">
-            <div className="text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              02. Build GHCR Image
-            </div>
-            <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              The included GitHub Action builds and publishes multi-arch <code className="font-mono">amd64/arm64</code> images automatically.
-            </p>
+          <div className="flex justify-between">
+            <span>Scan cadence</span>
+            <span className="font-mono tabular-nums text-zinc-800 dark:text-zinc-200">
+              Every {scanIntervalHours || 6}h
+            </span>
           </div>
-          <div className="p-4">
-            <div className="text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              03. Set Package Public
-            </div>
-            <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              In GitHub Packages settings, switch <code className="font-mono">immich_autoalbums</code> visibility to Public so Unraid can pull anonymously.
-            </p>
-          </div>
-          <div className="p-4">
-            <div className="text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              04. Submit Unraid CA
-            </div>
-            <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              Register <code className="font-mono">unraid/immich-autoalbums.xml</code> with Unraid Community Applications moderation.
-            </p>
-          </div>
-        </div>
-
-        {/* File Viewer & Download Bar */}
-        <div className="p-6">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-1 overflow-x-auto rounded-lg bg-neutral-100 dark:bg-neutral-900 p-1 border border-neutral-200/80 dark:border-neutral-800">
-              {(Object.keys(BUNDLE_META) as BundleTab[]).map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setActiveTab(key)}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                    activeTab === key
-                      ? 'bg-white dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100 shadow-xs'
-                      : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200'
-                  }`}
-                >
-                  {BUNDLE_META[key].label}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleCopy}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3 py-1.5 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
-              >
-                {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
-                {copied ? 'Copied' : 'Copy'}
-              </button>
-              <button
-                type="button"
-                onClick={handleDownload}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 dark:bg-neutral-100 px-3.5 py-1.5 text-xs font-medium text-white dark:text-neutral-900 hover:opacity-90 whitespace-nowrap shrink-0"
-              >
-                <Download className="h-3.5 w-3.5" />
-                Download {BUNDLE_META[activeTab].fileName}
-              </button>
-            </div>
-          </div>
-
-          <pre className="mt-4 max-h-96 overflow-auto rounded-lg border border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-[#0B0E14] p-4 font-mono text-xs leading-relaxed text-neutral-800 dark:text-neutral-200">
-            <code>{currentBundleContent || 'Loading deployment manifest...'}</code>
-          </pre>
         </div>
       </section>
     </div>

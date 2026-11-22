@@ -1,6 +1,5 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
-import * as yaml from 'js-yaml';
 import path from 'path';
 import type {
   AssetRecord,
@@ -212,88 +211,6 @@ export function saveSettings(partial: Partial<OrganizerSettings>): OrganizerSett
 function clampNum(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min;
   return Math.max(min, Math.min(max, n));
-}
-
-export function settingsToYaml(settings: OrganizerSettings): string {
-  const doc = {
-    version: 1,
-    immich: {
-      url: '${IMMICH_URL}',
-      api_key: '${IMMICH_API_KEY}',
-      scan_interval_hours: settings.scanIntervalHours,
-    },
-    clustering: {
-      home_radius_km: settings.homeRadiusKm,
-      trip_gap_hours: settings.tripGapHours,
-      local_event_radius_meters: settings.localEventRadiusMeters,
-      local_event_gap_hours: settings.localEventGapHours,
-      min_photos_per_album: settings.minPhotosPerAlbum,
-    },
-    color_tone: {
-      color_space: 'CIELAB',
-      palette_swatches: 5,
-      sliding_window_size: 5,
-      scene_split_gap_minutes: settings.sceneSplitGapMins,
-      emd_threshold: settings.emdThreshold,
-    },
-    albums: {
-      title_prefix: settings.titlePrefix,
-      structured_prefix_naming: settings.useStructuredPrefix,
-      create_master_event_album: settings.createMasterAlbum,
-      create_mood_sub_albums: settings.createMoodSubalbums,
-    },
-    exclusions: {
-      ignore_screenshots: true,
-      ignore_archived_and_trashed: true,
-      ignore_already_albumed: true,
-      excluded_paths: settings.excludedPaths,
-    },
-  };
-  return yaml.dump(doc, { lineWidth: 100, noRefs: true });
-}
-
-export function parseYamlToSettings(yamlText: string): Partial<OrganizerSettings> {
-  const parsed = yaml.load(yamlText) as Record<string, Record<string, unknown>> | null;
-  if (!parsed || typeof parsed !== 'object') {
-    throw new Error('Invalid YAML document structure');
-  }
-
-  const out: Partial<OrganizerSettings> = {};
-  if (parsed.clustering) {
-    if (typeof parsed.clustering.home_radius_km === 'number')
-      out.homeRadiusKm = parsed.clustering.home_radius_km;
-    if (typeof parsed.clustering.trip_gap_hours === 'number')
-      out.tripGapHours = parsed.clustering.trip_gap_hours;
-    if (typeof parsed.clustering.local_event_radius_meters === 'number')
-      out.localEventRadiusMeters = parsed.clustering.local_event_radius_meters;
-    if (typeof parsed.clustering.local_event_gap_hours === 'number')
-      out.localEventGapHours = parsed.clustering.local_event_gap_hours;
-    if (typeof parsed.clustering.min_photos_per_album === 'number')
-      out.minPhotosPerAlbum = parsed.clustering.min_photos_per_album;
-  }
-  if (parsed.color_tone) {
-    if (typeof parsed.color_tone.scene_split_gap_minutes === 'number')
-      out.sceneSplitGapMins = parsed.color_tone.scene_split_gap_minutes;
-    if (typeof parsed.color_tone.emd_threshold === 'number')
-      out.emdThreshold = parsed.color_tone.emd_threshold;
-  }
-  if (parsed.albums) {
-    if (typeof parsed.albums.title_prefix === 'string')
-      out.titlePrefix = parsed.albums.title_prefix;
-    if (typeof parsed.albums.structured_prefix_naming === 'boolean')
-      out.useStructuredPrefix = parsed.albums.structured_prefix_naming;
-    if (typeof parsed.albums.create_master_event_album === 'boolean')
-      out.createMasterAlbum = parsed.albums.create_master_event_album;
-    if (typeof parsed.albums.create_mood_sub_albums === 'boolean')
-      out.createMoodSubalbums = parsed.albums.create_mood_sub_albums;
-  }
-  if (parsed.exclusions && Array.isArray(parsed.exclusions.excluded_paths)) {
-    out.excludedPaths = parsed.exclusions.excluded_paths.map(String);
-  }
-  if (parsed.immich && typeof parsed.immich.scan_interval_hours === 'number') {
-    out.scanIntervalHours = parsed.immich.scan_interval_hours;
-  }
-  return out;
 }
 
 export interface DbAssetRow {

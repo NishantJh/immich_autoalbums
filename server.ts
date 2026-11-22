@@ -14,16 +14,16 @@ import {
   getPipelineSummary,
   getSettings,
   getSyncHistory,
-  parseYamlToSettings,
   purgeDemoAssets,
   saveSettings,
-  settingsToYaml,
   THUMBNAIL_DIR,
 } from './src/server/db.ts';
 import {
   checkImmichStatus,
   clearSavedImmichConnection,
+  getActiveImmichKey,
   ingestFromLiveImmich,
+  normalizeApiKey,
   probeImmichConnection,
   saveImmichConnection,
   validateImmichUrl,
@@ -36,169 +36,6 @@ import {
 } from './src/server/pipeline.ts';
 
 const PORT = Number(process.env.PORT || 3000);
-const REPO_OWNER = 'NishantJh';
-const REPO_NAME = 'immich_autoalbums';
-const REPO_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}`;
-const IMAGE_REF = `ghcr.io/${REPO_OWNER.toLowerCase()}/${REPO_NAME}:latest`;
-
-function buildDockerComposeYaml(scanIntervalHours: number): string {
-  return `services:
-  immich-autoalbums:
-    container_name: immich-autoalbums
-    image: ${IMAGE_REF}
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - DATA_DIR=/app/data
-      - IMMICH_URL=\${IMMICH_URL}
-      - IMMICH_API_KEY=\${IMMICH_API_KEY}
-      - SCAN_INTERVAL_HOURS=${scanIntervalHours}
-      - TZ=UTC
-    volumes:
-      - ./appdata:/app/data
-    labels:
-      net.unraid.docker.icon: "https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.png"
-      net.unraid.docker.webui: "http://[IP]:[PORT:3000]"
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-`;
-}
-
-function buildUnraidXml(scanIntervalHours: number): string {
-  return `<?xml version="1.0"?>
-<Container version="2">
-  <Name>immich_chromacluster</Name>
-  <Repository>${IMAGE_REF}</Repository>
-  <Registry>${REPO_URL}/pkgs/container/${REPO_NAME}</Registry>
-  <Network>bridge</Network>
-  <Shell>sh</Shell>
-  <Privileged>false</Privileged>
-  <Support>${REPO_URL}/issues</Support>
-  <Project>${REPO_URL}</Project>
-  <ReadMe>${REPO_URL}#readme</ReadMe>
-  <License>MIT</License>
-  <Overview>ChromaCluster — Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
-  <Category>MediaApp:Photos Tools:</Category>
-  <WebUI>http://[IP]:[PORT:3000]</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/unraid/immich-autoalbums.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.png</Icon>
-  <ExtraParams>--restart=unless-stopped</ExtraParams>
-  <Requires>An active Immich server and an Immich API key created under Account Settings -&gt; API Keys.</Requires>
-  <Config Name="Web UI Port" Target="3000" Default="3000" Mode="tcp" Description="Port for the ChromaCluster review dashboard." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
-  <Config Name="AppData Directory" Target="/app/data" Default="/mnt/user/appdata/immich_chromacluster" Mode="rw" Description="Persistent storage for the SQLite CIELAB feature cache, thumbnails, and sync ledger." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/immich_chromacluster</Config>
-  <Config Name="Immich Server URL" Target="IMMICH_URL" Default="http://192.168.1.50:2283" Mode="" Description="Base URL of your Immich server (e.g. http://immich:2283 or https://photos.yourdomain.com)." Type="Variable" Display="always" Required="true" Mask="false"/>
-  <Config Name="Immich API Key" Target="IMMICH_API_KEY" Default="" Mode="" Description="Immich API key with asset read, smart search, and album write permissions." Type="Variable" Display="always" Required="true" Mask="true"/>
-  <Config Name="Scan Interval (Hours)" Target="SCAN_INTERVAL_HOURS" Default="${scanIntervalHours}" Mode="" Description="Background incremental scan interval in hours." Type="Variable" Display="always" Required="false" Mask="false">${scanIntervalHours}</Config>
-  <Config Name="Data Directory" Target="DATA_DIR" Default="/app/data" Mode="" Description="Internal container path for SQLite storage." Type="Variable" Display="advanced" Required="true" Mask="false">/app/data</Config>
-  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="Unraid user ID (nobody = 99)." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
-  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Unraid group ID (users = 100)." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
-</Container>
-`;
-}
-
-function buildDockerfileText(): string {
-  return `FROM node:22-alpine AS builder
-WORKDIR /app
-RUN apk add --no-cache python3 make g++
-COPY package.json ./
-RUN npm install --legacy-peer-deps --no-audit --no-fund
-COPY . .
-RUN npm run build
-
-FROM node:22-alpine AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=3000
-ENV DATA_DIR=/app/data
-
-LABEL org.opencontainers.image.title="${REPO_NAME}"
-LABEL org.opencontainers.image.description="Smart Event & CIELAB Color-Tone Album Organizer sidecar for Immich"
-LABEL org.opencontainers.image.source="${REPO_URL}"
-LABEL org.opencontainers.image.url="${REPO_URL}"
-LABEL org.opencontainers.image.licenses="MIT"
-LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.png"
-LABEL net.unraid.docker.webui="http://[IP]:[PORT:3000]"
-
-RUN apk add --no-cache python3 make g++
-COPY package.json ./
-RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund && npm install --no-save --legacy-peer-deps tsx
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/server.ts ./server.ts
-COPY --from=builder /app/src/server ./src/server
-COPY --from=builder /app/src/shared ./src/shared
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/LICENSE ./LICENSE
-RUN mkdir -p /app/data
-VOLUME ["/app/data"]
-EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \\
-  CMD node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["npx", "tsx", "server.ts"]
-`;
-}
-
-function buildGithubWorkflowYaml(): string {
-  return `name: Build and Publish Unraid Container Image
-
-on:
-  push:
-    branches: ["main"]
-    tags: ["v*"]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
-
-jobs:
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: \${{ github.actor }}
-          password: \${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${REPO_OWNER.toLowerCase()}/${REPO_NAME}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: \${{ steps.meta.outputs.tags }}
-          labels: \${{ steps.meta.outputs.labels }}
-          provenance: false
-          sbom: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-`;
-}
 
 async function startServer() {
   // Initialize SQLite, purge any legacy demo assets/thumbnails, and refresh summary if needed
@@ -252,14 +89,8 @@ async function startServer() {
       const { baseUrl } = validateImmichUrl(String(url || ''));
 
       if (testOnly) {
-        const cleanKey = String(apiKey || '').trim();
+        const cleanKey = normalizeApiKey(String(apiKey || '')) || getActiveImmichKey() || '';
         if (!cleanKey) {
-          // If testing an already-saved URL without retyping key, check status directly
-          const current = await checkImmichStatus();
-          if (current.configured && current.baseUrl === baseUrl) {
-            res.json({ status: current, probe: current });
-            return;
-          }
           res.status(400).json({ error: 'Enter an Immich API key to test.' });
           return;
         }
@@ -578,59 +409,27 @@ async function startServer() {
     }
   });
 
-  // Settings & config.yaml endpoints
+  // Settings endpoints (persisted in SQLite)
   app.get('/api/settings', (_req, res) => {
     const settings = getSettings();
-    res.json({ settings, yaml: settingsToYaml(settings) });
+    res.json({ settings });
   });
 
   app.put('/api/settings', (req, res) => {
     try {
-      const { settings: partial, yaml: rawYaml, rerun } = req.body as {
+      const { settings: partial, rerun } = req.body as {
         settings?: Record<string, unknown>;
-        yaml?: string;
         rerun?: boolean;
       };
-      const updates =
-        typeof rawYaml === 'string' && rawYaml.trim().length > 0
-          ? parseYamlToSettings(rawYaml)
-          : (partial || {});
-      const saved = saveSettings(updates);
+      const saved = saveSettings(partial || {});
       const pipeline = rerun ? runFullPipeline() : null;
       res.json({
         settings: saved,
-        yaml: settingsToYaml(saved),
         ...(pipeline ? { summary: pipeline.summary, clusters: pipeline.clusters } : {}),
       });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid settings' });
     }
-  });
-
-  // Deployment bundle (Unraid Community Apps XML, ca_profile.xml, docker-compose.yml, Dockerfile, GitHub Actions, LICENSE, config.yaml)
-  app.get('/api/deploy/bundle', (_req, res) => {
-    const settings = getSettings();
-    const licensePath = path.resolve(process.cwd(), 'LICENSE');
-    const licenseText = fs.existsSync(licensePath)
-      ? fs.readFileSync(licensePath, 'utf8')
-      : 'MIT License';
-    const caProfilePath = path.resolve(process.cwd(), 'ca_profile.xml');
-    const caProfileXml = fs.existsSync(caProfilePath)
-      ? fs.readFileSync(caProfilePath, 'utf8')
-      : '';
-    res.json({
-      repoUrl: REPO_URL,
-      imageRef: IMAGE_REF,
-      files: {
-        unraidXml: buildUnraidXml(settings.scanIntervalHours),
-        caProfileXml,
-        dockerCompose: buildDockerComposeYaml(settings.scanIntervalHours),
-        dockerfile: buildDockerfileText(),
-        githubWorkflow: buildGithubWorkflowYaml(),
-        license: licenseText,
-        configYaml: settingsToYaml(settings),
-      },
-    });
   });
 
   // Vite dev middleware vs production dist static serving

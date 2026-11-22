@@ -1,6 +1,7 @@
 import {
   Check,
   CheckSquare,
+  FolderKanban,
   GitMerge,
   Pencil,
   RotateCcw,
@@ -11,9 +12,10 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ClusterRecord } from '../shared/types.ts';
 import { PaletteBar } from './PaletteBar.tsx';
+import { ThumbnailImage } from './ThumbnailImage.tsx';
 
 interface ReviewQueueViewProps {
   clusters: ClusterRecord[];
@@ -33,7 +35,12 @@ function formatDateSpan(startIso: string, endIso: string): string {
   const e = new Date(endIso);
   if (Number.isNaN(s.getTime())) return '';
   const fmt = (d: Date) =>
-    d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+    d.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: 'UTC',
+    });
   const sStr = fmt(s);
   const eStr = fmt(e);
   return sStr === eStr ? sStr : `${sStr} – ${eStr}`;
@@ -52,7 +59,7 @@ function statusText(cluster: ClusterRecord): { label: string; className: string 
   if (hasNewPhotos) {
     const delta = cluster.assetIds.length - cluster.syncedAssetCount;
     return {
-      label: `+${delta} new photos to append`,
+      label: `+${delta} new to append`,
       className: 'text-amber-700 dark:text-amber-400 font-medium',
     };
   }
@@ -60,12 +67,12 @@ function statusText(cluster: ClusterRecord): { label: string; className: string 
     return { label: 'Synced', className: 'text-emerald-700 dark:text-emerald-400 font-medium' };
   }
   if (cluster.status === 'approved') {
-    return { label: 'Approved for sync', className: 'text-indigo-700 dark:text-indigo-400 font-medium' };
+    return { label: 'Approved', className: 'text-indigo-600 dark:text-indigo-400 font-medium' };
   }
   if (cluster.status === 'discarded') {
-    return { label: 'Discarded', className: 'text-neutral-500 dark:text-neutral-500' };
+    return { label: 'Discarded', className: 'text-zinc-500 dark:text-zinc-500' };
   }
-  return { label: 'Awaiting review', className: 'text-neutral-600 dark:text-neutral-400' };
+  return { label: 'Awaiting review', className: 'text-zinc-600 dark:text-zinc-400' };
 }
 
 export function ReviewQueueView({
@@ -90,6 +97,15 @@ export function ReviewQueueView({
     () => clusters.find((c) => c.id === inspectClusterId) || null,
     [clusters, inspectClusterId]
   );
+
+  useEffect(() => {
+    if (!inspectClusterId) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setInspectClusterId(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [inspectClusterId]);
 
   const filteredClusters = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -155,7 +171,7 @@ export function ReviewQueueView({
     { key: 'pending', label: 'Needs Review', count: counts.pending },
     { key: 'trips', label: 'Trips', count: counts.trips },
     { key: 'local', label: 'Local Events', count: counts.local },
-    { key: 'chapters', label: 'Color Chapters', count: counts.chapters },
+    { key: 'chapters', label: 'Chapters', count: counts.chapters },
     { key: 'synced', label: 'Synced', count: counts.synced },
     { key: 'discarded', label: 'Discarded', count: counts.discarded },
   ];
@@ -163,8 +179,8 @@ export function ReviewQueueView({
   return (
     <div className="space-y-6">
       {/* Toolbar: Segmented Filter Controls + Search */}
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex items-center gap-1 overflow-x-auto rounded-lg bg-neutral-100 dark:bg-neutral-900 p-1 border border-neutral-200/80 dark:border-neutral-800">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div className="flex items-center gap-0.5 overflow-x-auto rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-zinc-100/80 dark:bg-[#11141B] p-1">
           {tabs.map((tab) => {
             const active = filter === tab.key;
             return (
@@ -172,36 +188,49 @@ export function ReviewQueueView({
                 key={tab.key}
                 type="button"
                 onClick={() => setFilter(tab.key)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 tabular-nums ${
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
                   active
-                    ? 'bg-white dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100 shadow-xs'
-                    : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200'
+                    ? 'bg-white dark:bg-[#1B202C] text-zinc-900 dark:text-zinc-100 shadow-xs'
+                    : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
                 }`}
               >
-                {tab.label} <span className="ml-1 opacity-60 font-mono">{tab.count}</span>
+                {tab.label}{' '}
+                <span className="ml-1 font-mono text-[11px] opacity-60">{tab.count}</span>
               </button>
             );
           })}
         </div>
 
-        <div className="relative w-full lg:w-72 shrink-0">
-          <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-neutral-400" />
+        <div className="relative w-full xl:w-72 shrink-0">
+          <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400 dark:text-zinc-500" />
           <input
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Filter by title, city, or mood..."
-            className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] pl-9 pr-3 py-2 text-sm text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500"
+            placeholder="Search title, city, or mood..."
+            className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] pl-9 pr-8 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
           />
+          {query && (
+            <button
+              type="button"
+              onClick={() => setQuery('')}
+              aria-label="Clear search"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
       {/* Merge Selection Bar */}
       {selectedIds.length > 0 && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-indigo-200 dark:border-indigo-900/70 bg-indigo-50/70 dark:bg-indigo-950/30 px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200 dark:border-indigo-500/30 bg-indigo-50/70 dark:bg-indigo-950/30 px-5 py-3.5">
           <div className="text-sm text-indigo-950 dark:text-indigo-200">
             <span className="font-semibold font-mono tabular-nums">{selectedIds.length}</span>{' '}
-            {selectedIds.length === 1 ? 'cluster selected' : 'clusters selected for merge'}
+            {selectedIds.length === 1
+              ? 'cluster selected — select another to merge'
+              : 'clusters selected for merge'}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {selectedIds.length >= 2 && (
@@ -211,13 +240,13 @@ export function ReviewQueueView({
                   value={mergeTitle}
                   onChange={(e) => setMergeTitle(e.target.value)}
                   placeholder="Optional merged album title"
-                  className="w-56 rounded-md border border-indigo-200 dark:border-indigo-800 bg-white dark:bg-[#131722] px-3 py-1.5 text-xs text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  className="w-56 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-white dark:bg-[#0D1017] px-3 py-1.5 text-xs text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
                 <button
                   type="button"
                   disabled={busyId === 'merge'}
                   onClick={handleMergeSubmit}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap shrink-0"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap shrink-0 transition-colors"
                 >
                   <GitMerge className="h-3.5 w-3.5" />
                   Merge Selected
@@ -230,7 +259,7 @@ export function ReviewQueueView({
                 setSelectedIds([]);
                 setMergeTitle('');
               }}
-              className="rounded-md px-3 py-1.5 text-xs font-medium text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/60 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
+              className="rounded-lg px-3 py-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200/60 dark:hover:bg-white/[0.06] whitespace-nowrap shrink-0 transition-colors"
             >
               Clear
             </button>
@@ -240,22 +269,25 @@ export function ReviewQueueView({
 
       {/* Proposed Album Cards Grid */}
       {filteredClusters.length === 0 ? (
-        <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] p-12 text-center">
-          <p className="text-sm font-medium text-neutral-900 dark:text-neutral-100">
+        <div className="rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] px-6 py-14 text-center">
+          <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-zinc-50 dark:bg-[#171B24] text-zinc-500 dark:text-zinc-400">
+            <FolderKanban className="h-5 w-5" />
+          </div>
+          <p className="mt-4 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
             {clusters.length === 0
               ? 'No album proposals yet'
               : 'No album proposals match this filter'}
           </p>
-          <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
+          <p className="mx-auto mt-1.5 max-w-md text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
             {clusters.length === 0
-              ? 'Connect your Immich server or upload local photos in Library & Ingest, then click Run Scan.'
-              : 'Try switching filter tabs, lowering the minimum photo threshold in Pipeline Lab, or uploading local photos.'}
+              ? 'Connect your Immich server or drop local photos in Library & Ingest, then run a scan to generate event and CIELAB color-tone albums.'
+              : 'Try clearing the search input, switching filter tabs, or lowering the minimum photo threshold in Pipeline Lab.'}
           </p>
           {clusters.length === 0 && onOpenLibrary && (
             <button
               type="button"
               onClick={onOpenLibrary}
-              className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 transition-colors"
+              className="mt-5 inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 transition-colors"
             >
               Open Library &amp; Ingest
             </button>
@@ -275,25 +307,35 @@ export function ReviewQueueView({
             return (
               <article
                 key={cluster.id}
-                className={`flex flex-col rounded-xl border bg-white dark:bg-[#131722] overflow-hidden transition-colors ${
+                className={`group flex flex-col rounded-xl border bg-white dark:bg-[#11141B] overflow-hidden transition-colors duration-150 ${
                   isSelected
-                    ? 'border-indigo-500 ring-1 ring-indigo-500/40'
-                    : 'border-neutral-200 dark:border-neutral-800'
+                    ? 'border-indigo-500 ring-1 ring-indigo-500/35'
+                    : 'border-zinc-200/90 dark:border-white/[0.08] hover:border-zinc-300 dark:hover:border-white/[0.15]'
                 }`}
               >
                 {/* 4-Photo Thumbnail Mosaic Strip */}
-                <div className="relative grid grid-cols-4 gap-0.5 bg-neutral-100 dark:bg-neutral-900 h-40">
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setInspectClusterId(cluster.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setInspectClusterId(cluster.id);
+                    }
+                  }}
+                  aria-label={`Inspect photos in ${cluster.title}`}
+                  className="relative grid grid-cols-4 gap-0.5 bg-zinc-100 dark:bg-[#0D1017] h-44 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500"
+                >
                   {previewAssets.map((asset) => (
                     <div
                       key={asset.id}
-                      className="relative h-full w-full overflow-hidden bg-neutral-200 dark:bg-neutral-800"
+                      className="relative h-full w-full overflow-hidden bg-zinc-200 dark:bg-[#171B24]"
                     >
-                      <img
+                      <ThumbnailImage
                         src={asset.thumbnailUrl}
                         alt={asset.fileName}
-                        loading="lazy"
-                        referrerPolicy="no-referrer"
-                        className="h-full w-full object-cover"
+                        className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.03]"
                       />
                     </div>
                   ))}
@@ -301,28 +343,31 @@ export function ReviewQueueView({
                     Array.from({ length: 4 - previewAssets.length }).map((_, i) => (
                       <div
                         key={`empty-${i}`}
-                        className="h-full w-full bg-neutral-100 dark:bg-neutral-900"
+                        className="h-full w-full bg-zinc-100 dark:bg-[#141821]"
                       />
                     ))}
 
-                  {/* Measured dark scrim at top-left for selection checkbox only */}
+                  {/* Measured dark scrim at top-left for selection checkbox */}
                   <div className="absolute inset-x-0 top-0 h-12 bg-gradient-to-b from-black/55 to-transparent pointer-events-none" />
                   <button
                     type="button"
-                    onClick={() => toggleSelect(cluster.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleSelect(cluster.id);
+                    }}
                     aria-label={`Select ${cluster.title} for merge`}
-                    className="absolute left-3 top-3 inline-flex items-center gap-1.5 text-xs font-medium text-white/95 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white rounded"
+                    className="absolute left-3 top-3 inline-flex items-center justify-center rounded-md bg-black/30 p-1 text-white/95 hover:bg-black/50 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white transition-colors"
                   >
                     {isSelected ? (
                       <CheckSquare className="h-4 w-4 text-indigo-300" />
                     ) : (
-                      <Square className="h-4 w-4 text-white/80" />
+                      <Square className="h-4 w-4 text-white/85" />
                     )}
                     <span className="sr-only">Select</span>
                   </button>
 
                   {/* Bottom scrim with photo count & LAB mean */}
-                  <div className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-gradient-to-t from-black/75 via-black/35 to-transparent px-3.5 py-2 text-[11px] font-mono tabular-nums text-white/95">
+                  <div className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-gradient-to-t from-black/80 via-black/40 to-transparent px-4 py-2.5 text-[11px] font-mono tabular-nums text-white/95">
                     <span>{cluster.assetIds.length} photos</span>
                     <span>
                       L*{cluster.avgLab.l.toFixed(0)} · a*{cluster.avgLab.a >= 0 ? '+' : ''}
@@ -339,9 +384,9 @@ export function ReviewQueueView({
                     <PaletteBar swatches={cluster.palette} heightClass="h-3" interactive />
                   </div>
 
-                  {/* Quiet 1-line kicker metadata (Zero-Pill Discipline) */}
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-neutral-500 dark:text-neutral-400">
-                    <span className="font-medium text-neutral-700 dark:text-neutral-300">
+                  {/* Quiet 1-line kicker metadata */}
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+                    <span className="font-medium text-zinc-700 dark:text-zinc-300">
                       {clusterTypeLabel(cluster.clusterType)}
                     </span>
                     <span aria-hidden="true">·</span>
@@ -363,34 +408,35 @@ export function ReviewQueueView({
                             if (e.key === 'Escape') setEditingId(null);
                           }}
                           autoFocus
-                          className="flex-1 rounded-md border border-indigo-500 bg-white dark:bg-[#0B0E14] px-2.5 py-1.5 text-sm font-semibold text-neutral-900 dark:text-neutral-100 focus:outline-none"
+                          className="flex-1 rounded-lg border border-indigo-500 bg-white dark:bg-[#0A0C10] px-2.5 py-1.5 text-sm font-semibold text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
                         />
                         <button
                           type="button"
                           onClick={() => handleCommitRename(cluster.id)}
-                          className="rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 whitespace-nowrap shrink-0"
+                          className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 whitespace-nowrap shrink-0"
                         >
                           Save
                         </button>
                         <button
                           type="button"
                           onClick={() => setEditingId(null)}
-                          className="rounded-md px-2 py-1.5 text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-200"
+                          className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-white/[0.06] dark:hover:text-zinc-200"
                           aria-label="Cancel rename"
                         >
                           <X className="h-4 w-4" />
                         </button>
                       </div>
                     ) : (
-                      <div className="group flex items-start justify-between gap-2">
-                        <h3 className="text-base font-semibold text-neutral-900 dark:text-neutral-100 leading-snug">
+                      <div className="flex items-start justify-between gap-2">
+                        <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 leading-snug">
                           {cluster.title}
                         </h3>
                         <button
                           type="button"
                           onClick={() => handleStartRename(cluster)}
                           title="Rename album"
-                          className="rounded p-1 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800 dark:hover:text-neutral-200 transition-colors shrink-0"
+                          aria-label={`Rename ${cluster.title}`}
+                          className="rounded-md p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-white/[0.07] dark:hover:text-zinc-200 transition-colors shrink-0"
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -398,8 +444,8 @@ export function ReviewQueueView({
                     )}
                   </div>
 
-                  {/* Location, Date Range, Hash Metadata */}
-                  <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-neutral-500 dark:text-neutral-400">
+                  {/* Location, Date Range, EMD Metadata */}
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-500 dark:text-zinc-400">
                     <span>{cluster.locationLabel}</span>
                     <span aria-hidden="true">·</span>
                     <span className="tabular-nums">
@@ -416,74 +462,76 @@ export function ReviewQueueView({
                   </div>
 
                   {/* Action Footer */}
-                  <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-neutral-100 dark:border-neutral-800/80 pt-3.5">
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setInspectClusterId(cluster.id)}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3 py-1.5 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors whitespace-nowrap shrink-0"
-                      >
-                        <Scissors className="h-3.5 w-3.5" />
-                        Inspect &amp; Split
-                      </button>
+                  <div className="mt-auto pt-5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 dark:border-white/[0.06] pt-3.5">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setInspectClusterId(cluster.id)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 dark:border-white/[0.10] px-3 py-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-white/[0.05] transition-colors whitespace-nowrap shrink-0"
+                        >
+                          <Scissors className="h-3.5 w-3.5" />
+                          Inspect &amp; Split
+                        </button>
 
-                      {cluster.status === 'discarded' ? (
-                        <button
-                          type="button"
-                          disabled={isBusy}
-                          onClick={() => onStatusChange(cluster.id, 'pending')}
-                          className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors whitespace-nowrap shrink-0"
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                          Restore
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          disabled={isBusy}
-                          onClick={() => onStatusChange(cluster.id, 'discarded')}
-                          className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-neutral-500 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 dark:hover:text-rose-400 transition-colors whitespace-nowrap shrink-0"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                          Discard
-                        </button>
-                      )}
-                    </div>
+                        {cluster.status === 'discarded' ? (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => onStatusChange(cluster.id, 'pending')}
+                            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-white/[0.06] transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            Restore
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => onStatusChange(cluster.id, 'discarded')}
+                            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-zinc-500 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 dark:hover:text-rose-400 transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Discard
+                          </button>
+                        )}
+                      </div>
 
-                    <div className="flex items-center gap-2">
-                      {cluster.status === 'pending' && !hasPendingAppend && (
-                        <button
-                          type="button"
-                          disabled={isBusy}
-                          onClick={() => onStatusChange(cluster.id, 'approved')}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/70 dark:bg-indigo-950/40 px-3 py-1.5 text-xs font-medium text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-950/70 transition-colors whitespace-nowrap shrink-0"
-                        >
-                          <Check className="h-3.5 w-3.5" />
-                          Approve
-                        </button>
-                      )}
+                      <div className="flex items-center gap-2">
+                        {cluster.status === 'pending' && !hasPendingAppend && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => onStatusChange(cluster.id, 'approved')}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 dark:border-indigo-500/35 bg-indigo-50/70 dark:bg-indigo-950/40 px-3 py-1.5 text-xs font-medium text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-950/70 transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                            Approve
+                          </button>
+                        )}
 
-                      {cluster.status !== 'discarded' && (
-                        <button
-                          type="button"
-                          disabled={isBusy || (cluster.status === 'synced' && !hasPendingAppend)}
-                          onClick={() => onSyncOne(cluster.id)}
-                          className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                            cluster.status === 'synced' && !hasPendingAppend
-                              ? 'bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400 cursor-default'
-                              : 'bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50'
-                          }`}
-                        >
-                          <UploadCloud className="h-3.5 w-3.5" />
-                          {isBusy
-                            ? 'Syncing...'
-                            : hasPendingAppend
-                              ? `Append +${cluster.assetIds.length - cluster.syncedAssetCount}`
-                              : cluster.status === 'synced'
-                                ? 'Synced'
-                                : 'Sync to Immich'}
-                        </button>
-                      )}
+                        {cluster.status !== 'discarded' && (
+                          <button
+                            type="button"
+                            disabled={isBusy || (cluster.status === 'synced' && !hasPendingAppend)}
+                            onClick={() => onSyncOne(cluster.id)}
+                            className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                              cluster.status === 'synced' && !hasPendingAppend
+                                ? 'bg-zinc-100 dark:bg-white/[0.06] text-zinc-500 dark:text-zinc-400 cursor-default'
+                                : 'bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50'
+                            }`}
+                          >
+                            <UploadCloud className="h-3.5 w-3.5" />
+                            {isBusy
+                              ? 'Syncing...'
+                              : hasPendingAppend
+                                ? `Append +${cluster.assetIds.length - cluster.syncedAssetCount}`
+                                : cluster.status === 'synced'
+                                  ? 'Synced'
+                                  : 'Sync to Immich'}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -496,20 +544,23 @@ export function ReviewQueueView({
       {/* Inspect & Manual Split Modal Drawer */}
       {inspectedCluster && (
         <div
-          className="fixed inset-0 z-50 flex justify-end bg-black/45 backdrop-blur-[1px]"
+          className="fixed inset-0 z-50 flex justify-end bg-black/50 backdrop-blur-[2px]"
           onClick={() => setInspectClusterId(null)}
         >
           <div
-            className="flex h-full w-full max-w-2xl flex-col bg-white dark:bg-[#0F131D] border-l border-neutral-200 dark:border-neutral-800 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-label={inspectedCluster.title}
+            className="animate-drawer-in flex h-full w-full max-w-2xl flex-col bg-white dark:bg-[#0D1017] border-l border-zinc-200 dark:border-white/[0.08] shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-start justify-between gap-4 border-b border-neutral-200 dark:border-neutral-800 px-6 py-4">
-              <div>
-                <p className="text-xs text-neutral-500 dark:text-neutral-400">
+            <div className="flex items-start justify-between gap-4 border-b border-zinc-200 dark:border-white/[0.08] px-6 py-4">
+              <div className="min-w-0">
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
                   {clusterTypeLabel(inspectedCluster.clusterType)} · {inspectedCluster.moodLabel} ·{' '}
                   <span className="font-mono">{inspectedCluster.clusterHash}</span>
                 </p>
-                <h2 className="mt-0.5 text-lg font-semibold text-neutral-900 dark:text-neutral-100">
+                <h2 className="mt-0.5 text-lg font-semibold text-zinc-900 dark:text-zinc-100 truncate">
                   {inspectedCluster.title}
                 </h2>
               </div>
@@ -517,33 +568,40 @@ export function ReviewQueueView({
                 type="button"
                 onClick={() => setInspectClusterId(null)}
                 aria-label="Close inspector"
-                className="rounded-lg p-1.5 text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-neutral-900 dark:hover:text-neutral-100"
+                className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/[0.06] hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            <div className="border-b border-neutral-200 dark:border-neutral-800 px-6 py-4 bg-neutral-50/70 dark:bg-[#131722]">
-              <div className="mb-2 flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400">
-                <span>Cluster 5-color CIELAB palette (hover or click any swatch)</span>
+            <div className="border-b border-zinc-200 dark:border-white/[0.08] px-6 py-4 bg-zinc-50/80 dark:bg-[#11141B]">
+              <div className="mb-2 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+                <span>Cluster 5-color CIELAB palette</span>
                 <span className="font-mono tabular-nums">
                   {inspectedCluster.assetIds.length} frames
                 </span>
               </div>
-              <PaletteBar swatches={inspectedCluster.palette} heightClass="h-4" interactive />
+              <PaletteBar
+                swatches={inspectedCluster.palette}
+                heightClass="h-4"
+                interactive={false}
+                showLegend
+              />
             </div>
 
             <div className="flex-1 overflow-y-auto px-6 py-4">
-              <p className="mb-4 text-xs text-neutral-500 dark:text-neutral-400">
-                Frames ordered chronologically. Click <strong className="text-neutral-800 dark:text-neutral-200">Split here</strong> between any two photos to divide this cluster into two separate Immich albums.
+              <p className="mb-4 text-xs text-zinc-500 dark:text-zinc-400">
+                Frames ordered chronologically. Click{' '}
+                <strong className="font-medium text-zinc-800 dark:text-zinc-200">Split here</strong>{' '}
+                between any two photos to divide this cluster into two separate Immich albums.
               </p>
 
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 {(inspectedCluster.assets || []).map((asset, idx) => (
                   <div key={asset.id}>
                     {idx > 0 && (
                       <div className="my-2 flex items-center gap-3">
-                        <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-800" />
+                        <div className="h-px flex-1 bg-zinc-200/80 dark:bg-white/[0.07]" />
                         <button
                           type="button"
                           disabled={busyId === inspectedCluster.id}
@@ -551,28 +609,25 @@ export function ReviewQueueView({
                             await onSplit(inspectedCluster.id, idx);
                             setInspectClusterId(null);
                           }}
-                          className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium text-neutral-500 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-950/50 dark:hover:text-indigo-300 transition-colors whitespace-nowrap"
+                          className="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px] font-medium text-zinc-500 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-950/50 dark:hover:text-indigo-300 transition-colors whitespace-nowrap"
                         >
                           <Scissors className="h-3 w-3" />
                           Split here ({idx} / {(inspectedCluster.assets || []).length - idx})
                         </button>
-                        <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-800" />
+                        <div className="h-px flex-1 bg-zinc-200/80 dark:bg-white/[0.07]" />
                       </div>
                     )}
 
-                    <div className="flex items-center gap-3.5 rounded-lg border border-neutral-200/80 dark:border-neutral-800/80 p-2.5">
-                      <img
-                        src={asset.thumbnailUrl}
-                        alt={asset.fileName}
-                        referrerPolicy="no-referrer"
-                        className="h-14 w-20 rounded object-cover bg-neutral-100 dark:bg-neutral-900 shrink-0"
-                      />
+                    <div className="flex items-center gap-3.5 rounded-lg border border-zinc-200/80 dark:border-white/[0.07] bg-white dark:bg-[#11141B] p-2.5">
+                      <div className="h-14 w-20 overflow-hidden rounded-md bg-zinc-100 dark:bg-[#171B24] shrink-0">
+                        <ThumbnailImage src={asset.thumbnailUrl} alt={asset.fileName} />
+                      </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="truncate text-sm font-medium text-neutral-900 dark:text-neutral-100">
+                          <span className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">
                             {asset.fileName}
                           </span>
-                          <span className="font-mono text-[11px] tabular-nums text-neutral-500 dark:text-neutral-400 shrink-0">
+                          <span className="font-mono text-[11px] tabular-nums text-zinc-500 dark:text-zinc-400 shrink-0">
                             {new Date(asset.localDateTime).toLocaleTimeString('en-US', {
                               hour: '2-digit',
                               minute: '2-digit',
@@ -581,7 +636,7 @@ export function ReviewQueueView({
                             UTC
                           </span>
                         </div>
-                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-neutral-500 dark:text-neutral-400">
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-zinc-500 dark:text-zinc-400">
                           <span>
                             {asset.exifMake && asset.exifModel
                               ? `${asset.exifMake} ${asset.exifModel}`
@@ -599,7 +654,9 @@ export function ReviewQueueView({
                           {asset.smartTags.length > 0 && (
                             <>
                               <span aria-hidden="true">·</span>
-                              <span className="truncate">{asset.smartTags.slice(0, 3).join(', ')}</span>
+                              <span className="truncate">
+                                {asset.smartTags.slice(0, 3).join(', ')}
+                              </span>
                             </>
                           )}
                         </div>

@@ -1,8 +1,11 @@
 import {
+  AlertCircle,
+  CheckCircle2,
   Database,
   FolderKanban,
   GitBranch,
   History,
+  Loader2,
   Menu,
   Moon,
   Play,
@@ -43,7 +46,7 @@ const SECTION_META: Record<
     label: 'Pipeline Lab',
     title: 'Four-Stage Clustering & CIELAB Scene Split',
     subtitle:
-      'Calibrate 5 km home-base inference, spatiotemporal gaps, and sliding-window Earth Mover’s Distance thresholds.',
+      'Calibrate home-base inference, spatiotemporal gaps, and sliding-window Earth Mover’s Distance thresholds.',
   },
   sync: {
     label: 'Sync Ledger',
@@ -55,13 +58,13 @@ const SECTION_META: Record<
     label: 'Library & Ingest',
     title: 'Photo Sources & SQLite Feature Cache',
     subtitle:
-      'Connect your self-hosted Immich server via environment variables or drop local photos for real EXIF and CIELAB extraction.',
+      'Connect your self-hosted Immich server or drop local photos for real EXIF and CIELAB palette extraction.',
   },
   rules: {
-    label: 'Rules & Unraid',
-    title: 'Exclusion Rules, Docker & Unraid Community App',
+    label: 'Rules & Config',
+    title: 'Exclusion Rules & Album Configuration',
     subtitle:
-      'Edit config.yaml safeguards and download pre-configured Unraid Community Applications and GitHub Container Registry manifests.',
+      'Configure ignored folders, Immich flat-album naming prefixes, and scheduled scan cadence.',
   },
 };
 
@@ -101,7 +104,7 @@ export default function App() {
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), 4200);
+    const t = setTimeout(() => setToast(null), 4500);
     return () => clearTimeout(t);
   }, [toast]);
 
@@ -157,7 +160,6 @@ export default function App() {
       };
       if (!res.ok) throw new Error(data.error || 'Pipeline run failed');
 
-      // Ensure brief visible Scanning state even when cached SQLite runs finish in <5 ms
       const elapsed = Date.now() - started;
       if (elapsed < 300) {
         await new Promise((r) => setTimeout(r, 300 - elapsed));
@@ -352,7 +354,6 @@ export default function App() {
 
   const handleSaveSettings = async (payload: {
     settings?: Partial<OrganizerSettings>;
-    yaml?: string;
     rerun: boolean;
   }) => {
     setIsScanning(true);
@@ -561,17 +562,26 @@ export default function App() {
     },
     { id: 'sync', label: 'Sync Ledger', icon: History, metric: syncedCount },
     { id: 'library', label: 'Library & Ingest', icon: Database, metric: assets.length },
-    { id: 'rules', label: 'Rules & Unraid', icon: Sliders },
+    { id: 'rules', label: 'Rules & Config', icon: Sliders },
   ];
 
   const meta = SECTION_META[section];
+  const hasHomeBase =
+    pipelineSummary &&
+    pipelineSummary.stage2.homeBaseCity &&
+    pipelineSummary.stage2.homeBaseCity !== '—';
 
   return (
-    <div className="min-h-screen flex bg-[#F8F9FA] text-[#111827] dark:bg-[#0B0E14] dark:text-[#F3F4F6]">
+    <div className="min-h-screen flex bg-[#F7F8FA] text-[#111318] dark:bg-[#0A0C10] dark:text-[#F1F3F7]">
       {/* Desktop Sidebar */}
-      <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 border-r border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#0F131D]">
-        <div className="flex h-16 items-center px-6 border-b border-neutral-200 dark:border-neutral-800">
-          <span className="font-display text-base font-bold tracking-tight text-neutral-900 dark:text-neutral-100 whitespace-nowrap">
+      <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 border-r border-zinc-200/90 dark:border-white/[0.07] bg-white dark:bg-[#0E1117]">
+        <div className="flex h-16 items-center gap-2.5 px-5 border-b border-zinc-200/80 dark:border-white/[0.07]">
+          <img
+            src="/icon.png"
+            alt=""
+            className="h-6 w-6 rounded-md shrink-0 ring-1 ring-black/10 dark:ring-white/15"
+          />
+          <span className="font-display text-[15px] font-bold tracking-tight text-zinc-900 dark:text-zinc-100 whitespace-nowrap">
             ChromaCluster
           </span>
         </div>
@@ -585,40 +595,58 @@ export default function App() {
                 key={item.id}
                 type="button"
                 onClick={() => setSection(item.id)}
-                className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium transition-colors whitespace-nowrap ${
+                className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
                   active
-                    ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-300'
-                    : 'text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800/60 hover:text-neutral-900 dark:hover:text-neutral-100'
+                    ? 'bg-indigo-50/90 text-indigo-700 dark:bg-indigo-500/[0.14] dark:text-indigo-300'
+                    : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/[0.04] hover:text-zinc-900 dark:hover:text-zinc-100'
                 }`}
               >
                 <span className="flex items-center gap-2.5">
-                  <Icon className="h-4 w-4 shrink-0" />
+                  <Icon
+                    className={`h-4 w-4 shrink-0 ${
+                      active ? 'text-indigo-600 dark:text-indigo-400' : 'opacity-75'
+                    }`}
+                  />
                   <span>{item.label}</span>
                 </span>
                 {typeof item.metric === 'number' && (
-                  <span className="font-mono text-xs tabular-nums opacity-70">{item.metric}</span>
+                  <span
+                    className={`font-mono text-xs tabular-nums ${
+                      active ? 'text-indigo-700 dark:text-indigo-300' : 'text-zinc-400 dark:text-zinc-500'
+                    }`}
+                  >
+                    {item.metric}
+                  </span>
                 )}
               </button>
             );
           })}
         </nav>
 
-        <div className="border-t border-neutral-200 dark:border-neutral-800 px-5 py-4 text-xs text-neutral-500 dark:text-neutral-400 space-y-1">
-          <div className="font-medium text-neutral-800 dark:text-neutral-200">
-            {immichStatus.reachable
-              ? 'Live Immich Sidecar'
-              : immichStatus.configured
-                ? 'Immich Unreachable'
-                : 'Immich Not Connected'}
-          </div>
-          <div className="truncate font-mono text-[11px]">
-            {immichStatus.hostLabel || 'Configure in Library & Ingest'}
-          </div>
+        <div className="border-t border-zinc-200/80 dark:border-white/[0.07] px-5 py-4 text-xs text-zinc-500 dark:text-zinc-400 space-y-1">
+          <button
+            type="button"
+            onClick={() => setSection('library')}
+            className="block w-full text-left group"
+          >
+            <div className="flex items-center justify-between gap-2 font-medium text-zinc-800 dark:text-zinc-200 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
+              <span className="truncate">
+                {immichStatus.reachable
+                  ? 'Live Immich Sidecar'
+                  : immichStatus.configured
+                    ? 'Immich Unreachable'
+                    : 'Immich Not Connected'}
+              </span>
+            </div>
+            <div className="mt-0.5 truncate font-mono text-[11px] text-zinc-500 dark:text-zinc-400">
+              {immichStatus.hostLabel || 'Configure in Library & Ingest'}
+            </div>
+          </button>
           <a
             href="https://github.com/NishantJh/immich_autoalbums"
             target="_blank"
             rel="noreferrer"
-            className="inline-block pt-1 text-[11px] text-indigo-600 dark:text-indigo-400 hover:underline"
+            className="inline-block pt-1.5 text-[11px] text-zinc-400 dark:text-zinc-500 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
           >
             NishantJh/immich_autoalbums
           </a>
@@ -628,20 +656,29 @@ export default function App() {
       {/* Mobile Drawer */}
       {mobileNavOpen && (
         <div
-          className="fixed inset-0 z-50 flex lg:hidden bg-black/45"
+          className="fixed inset-0 z-50 flex lg:hidden bg-black/50 backdrop-blur-[2px]"
           onClick={() => setMobileNavOpen(false)}
         >
           <div
-            className="flex w-64 flex-col bg-white dark:bg-[#0F131D] border-r border-neutral-200 dark:border-neutral-800"
+            className="flex w-64 flex-col bg-white dark:bg-[#0E1117] border-r border-zinc-200 dark:border-white/[0.08]"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex h-16 items-center justify-between px-5 border-b border-neutral-200 dark:border-neutral-800">
-              <span className="font-display text-base font-bold tracking-tight">ChromaCluster</span>
+            <div className="flex h-14 items-center justify-between px-4 border-b border-zinc-200 dark:border-white/[0.07]">
+              <div className="flex items-center gap-2">
+                <img
+                  src="/icon.png"
+                  alt=""
+                  className="h-6 w-6 rounded-md shrink-0 ring-1 ring-black/10 dark:ring-white/15"
+                />
+                <span className="font-display text-[15px] font-bold tracking-tight">
+                  ChromaCluster
+                </span>
+              </div>
               <button
                 type="button"
                 onClick={() => setMobileNavOpen(false)}
                 aria-label="Close navigation"
-                className="rounded-lg p-1.5 text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/[0.06]"
               >
                 <X className="h-5 w-5" />
               </button>
@@ -660,8 +697,8 @@ export default function App() {
                     }}
                     className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium ${
                       active
-                        ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-300'
-                        : 'text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800/60'
+                        ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/[0.14] dark:text-indigo-300'
+                        : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-white/[0.04]'
                     }`}
                   >
                     <span className="flex items-center gap-2.5">
@@ -669,7 +706,9 @@ export default function App() {
                       <span>{item.label}</span>
                     </span>
                     {typeof item.metric === 'number' && (
-                      <span className="font-mono text-xs tabular-nums opacity-70">{item.metric}</span>
+                      <span className="font-mono text-xs tabular-nums opacity-70">
+                        {item.metric}
+                      </span>
                     )}
                   </button>
                 );
@@ -681,23 +720,21 @@ export default function App() {
 
       {/* Main Workspace Column */}
       <div className="flex flex-1 flex-col lg:pl-64 min-w-0">
-        {/* Top Workspace Header (Breadcrumb Left, Single Primary CTA + Theme Toggle Right) */}
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-4 border-b border-neutral-200 dark:border-neutral-800 bg-white/95 dark:bg-[#0F131D]/95 backdrop-blur-xs px-4 sm:px-8">
+        {/* Top Workspace Header */}
+        <header className="sticky top-0 z-30 flex h-14 sm:h-16 items-center justify-between gap-4 border-b border-zinc-200/90 dark:border-white/[0.07] bg-white/92 dark:bg-[#0E1117]/92 backdrop-blur-sm px-4 sm:px-8">
           <div className="flex items-center gap-3 min-w-0">
             <button
               type="button"
               onClick={() => setMobileNavOpen(true)}
               aria-label="Open navigation"
-              className="rounded-lg p-2 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 lg:hidden"
+              className="rounded-lg p-2 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-white/[0.06] lg:hidden"
             >
               <Menu className="h-5 w-5" />
             </button>
             <div className="flex items-center gap-2 text-sm truncate">
-              <span className="text-neutral-400 dark:text-neutral-500 hidden sm:inline">
-                Workspace
-              </span>
-              <span className="text-neutral-300 dark:text-neutral-700 hidden sm:inline">/</span>
-              <span className="font-medium text-neutral-900 dark:text-neutral-100 truncate">
+              <span className="text-zinc-400 dark:text-zinc-500 hidden sm:inline">Workspace</span>
+              <span className="text-zinc-300 dark:text-zinc-700 hidden sm:inline">/</span>
+              <span className="font-medium text-zinc-900 dark:text-zinc-100 truncate">
                 {meta.label}
               </span>
             </div>
@@ -709,7 +746,7 @@ export default function App() {
               onClick={() => setDarkMode((prev) => !prev)}
               aria-label={darkMode ? 'Switch to light mode' : 'Switch to darkroom mode'}
               title={darkMode ? 'Switch to light mode' : 'Switch to darkroom mode'}
-              className="rounded-lg border border-neutral-200 dark:border-neutral-800 p-2 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+              className="rounded-lg border border-zinc-200/90 dark:border-white/[0.10] p-2 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-white/[0.06] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
             >
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </button>
@@ -721,7 +758,11 @@ export default function App() {
                 onClick={handleSyncApproved}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 tabular-nums"
               >
-                <UploadCloud className="h-3.5 w-3.5" />
+                {busyId === 'sync-all' ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <UploadCloud className="h-3.5 w-3.5" />
+                )}
                 {busyId === 'sync-all' ? 'Syncing...' : `Sync Approved (${approvedCount})`}
               </button>
             )}
@@ -731,9 +772,13 @@ export default function App() {
               disabled={isScanning}
               aria-busy={isScanning}
               onClick={handleRunPipeline}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-[#0E1117]"
             >
-              <Play className={`h-3.5 w-3.5 ${isScanning ? 'animate-pulse' : ''}`} />
+              {isScanning ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
               {isScanning ? 'Scanning...' : 'Run Scan'}
             </button>
           </div>
@@ -742,69 +787,65 @@ export default function App() {
         {/* Main Viewport Content */}
         <main className="mx-auto w-full max-w-[1280px] flex-1 px-4 py-6 sm:px-8 sm:py-8 space-y-6">
           {/* Page Header */}
-          <div className="flex flex-col gap-1">
-            <h1 className="text-2xl font-bold tracking-tight text-neutral-900 dark:text-neutral-100">
+          <div className="space-y-1">
+            <h1 className="text-xl sm:text-2xl font-bold tracking-[-0.02em] text-zinc-900 dark:text-zinc-100">
               {meta.title}
             </h1>
-            <p className="text-sm text-neutral-500 dark:text-neutral-400 max-w-3xl">
+            <p className="text-sm text-zinc-500 dark:text-zinc-400 max-w-3xl leading-relaxed">
               {meta.subtitle}
             </p>
           </div>
 
           {/* 4-Column Single-Elevation Summary Strip */}
           {pipelineSummary && (
-            <div className="grid grid-cols-2 divide-y divide-neutral-200 dark:divide-neutral-800 rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] sm:grid-cols-4 sm:divide-y-0 sm:divide-x">
+            <div className="grid grid-cols-2 divide-y divide-zinc-200/80 dark:divide-white/[0.07] rounded-xl border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] sm:grid-cols-4 sm:divide-y-0 sm:divide-x">
               <div className="px-5 py-4">
-                <div className="text-xs text-neutral-500 dark:text-neutral-400">
-                  Eligible Assets
-                </div>
-                <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-xl font-semibold font-mono tabular-nums text-neutral-900 dark:text-neutral-100">
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">Eligible Assets</div>
+                <div className="mt-1.5 flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
                     {pipelineSummary.stage1.eligibleAssets}
                   </span>
-                  <span className="text-xs text-neutral-500 font-mono tabular-nums">
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
                     of {pipelineSummary.stage1.totalAssets}
                   </span>
                 </div>
               </div>
 
               <div className="px-5 py-4">
-                <div className="text-xs text-neutral-500 dark:text-neutral-400">
-                  Inferred Home Base
-                </div>
-                <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-xl font-semibold text-neutral-900 dark:text-neutral-100 truncate">
-                    {pipelineSummary.stage2.homeBaseCity}
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">Inferred Home Base</div>
+                <div className="mt-1.5 flex items-baseline gap-2 min-w-0">
+                  <span className="text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 truncate">
+                    {hasHomeBase ? pipelineSummary.stage2.homeBaseCity : '—'}
                   </span>
-                  <span className="text-xs text-neutral-500 font-mono">
-                    {pipelineSummary.stage2.homeBaseGeohash}
-                  </span>
+                  {hasHomeBase &&
+                    pipelineSummary.stage2.homeBaseGeohash &&
+                    pipelineSummary.stage2.homeBaseGeohash !== '—' && (
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono shrink-0">
+                        {pipelineSummary.stage2.homeBaseGeohash}
+                      </span>
+                    )}
                 </div>
               </div>
 
               <div className="px-5 py-4">
-                <div className="text-xs text-neutral-500 dark:text-neutral-400">
-                  CIELAB Scene Splits
-                </div>
-                <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-xl font-semibold font-mono tabular-nums text-neutral-900 dark:text-neutral-100">
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">CIELAB Scene Splits</div>
+                <div className="mt-1.5 flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
                     {pipelineSummary.stage3.sceneSplitsDetected}
                   </span>
-                  <span className="text-xs text-neutral-500 tabular-nums">
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
                     {pipelineSummary.stage3.totalChaptersCreated} chapters
                   </span>
                 </div>
               </div>
 
               <div className="px-5 py-4">
-                <div className="text-xs text-neutral-500 dark:text-neutral-400">
-                  Albums Synced
-                </div>
-                <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-xl font-semibold font-mono tabular-nums text-neutral-900 dark:text-neutral-100">
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">Albums Synced</div>
+                <div className="mt-1.5 flex items-baseline gap-2">
+                  <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
                     {syncedCount}
                   </span>
-                  <span className="text-xs text-neutral-500 font-mono tabular-nums">
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
                     / {activeClusterCount} active
                   </span>
                 </div>
@@ -814,13 +855,16 @@ export default function App() {
 
           {/* Error / Loading / Active View */}
           {error ? (
-            <div className="rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50/70 dark:bg-rose-950/30 p-6 text-sm text-rose-800 dark:text-rose-200">
-              <p className="font-medium">Unable to load organizer state</p>
+            <div className="rounded-xl border border-rose-200 dark:border-rose-500/25 bg-rose-50/70 dark:bg-rose-950/30 p-6 text-sm text-rose-800 dark:text-rose-200">
+              <div className="flex items-center gap-2 font-semibold">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                Unable to load organizer state
+              </div>
               <p className="mt-1 text-xs opacity-85">{error}</p>
               <button
                 type="button"
                 onClick={loadBootstrap}
-                className="mt-3 rounded-lg bg-rose-700 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-rose-800"
+                className="mt-4 rounded-lg bg-rose-700 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-rose-800 transition-colors"
               >
                 Retry
               </button>
@@ -830,7 +874,7 @@ export default function App() {
               {[0, 1, 2, 3].map((n) => (
                 <div
                   key={n}
-                  className="h-72 rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] animate-pulse"
+                  className="h-72 rounded-xl border border-zinc-200/80 dark:border-white/[0.07] bg-white dark:bg-[#11141B] animate-pulse"
                 />
               ))}
             </div>
@@ -902,13 +946,26 @@ export default function App() {
         <div
           role="status"
           aria-live="polite"
-          className={`fixed bottom-5 right-5 z-50 max-w-md rounded-lg border px-4 py-3 text-xs font-medium shadow-lg ${
+          className={`animate-toast-in fixed bottom-5 right-5 z-50 flex max-w-md items-start gap-2.5 rounded-xl border px-4 py-3 text-xs font-medium shadow-lg ${
             toast.tone === 'err'
-              ? 'border-rose-300 bg-rose-50 text-rose-900 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-100'
-              : 'border-neutral-200 bg-white text-neutral-900 dark:border-neutral-700 dark:bg-[#131722] dark:text-neutral-100'
+              ? 'border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-500/30 dark:bg-[#1E1216] dark:text-rose-200'
+              : 'border-zinc-200 bg-white text-zinc-900 dark:border-white/[0.10] dark:bg-[#151923] dark:text-zinc-100'
           }`}
         >
-          {toast.text}
+          {toast.tone === 'err' ? (
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+          ) : (
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          )}
+          <span className="leading-relaxed">{toast.text}</span>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Dismiss notification"
+            className="ml-1 -mr-1 rounded p-0.5 opacity-60 hover:opacity-100 transition-opacity shrink-0"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
     </div>
