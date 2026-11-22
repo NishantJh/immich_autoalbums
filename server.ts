@@ -30,7 +30,6 @@ import {
   appendIncrementalTripPhotos,
   seedSampleLibraryIfEmpty,
 } from './src/server/sampleLibrary.ts';
-import { buildZipBuffer, collectRepoFiles } from './src/server/zipBuilder.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const REPO_OWNER = 'NishantJh';
@@ -535,22 +534,6 @@ async function startServer() {
         configYaml: settingsToYaml(settings),
       },
     });
-  });
-
-  // Download entire clean repository as a .zip for uploading or pushing to GitHub
-  app.get('/api/deploy/repo.zip', (_req, res) => {
-    try {
-      const files = collectRepoFiles(process.cwd());
-      const zipBuf = buildZipBuffer(files);
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="immich_autoalbums.zip"');
-      res.setHeader('Content-Length', String(zipBuf.length));
-      res.send(zipBuf);
-    } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to build repository archive',
-      });
-    }
   });
 
   // Vite dev middleware vs production dist static serving

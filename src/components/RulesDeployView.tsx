@@ -321,25 +321,15 @@ export function RulesDeployView({
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <a
-              href="/api/deploy/repo.zip"
-              download="immich_autoalbums.zip"
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Download className="h-3.5 w-3.5" />
-              Download Full Repo (.zip)
-            </a>
-            <a
-              href={bundle?.repoUrl || 'https://github.com/NishantJh/immich_autoalbums'}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline whitespace-nowrap shrink-0"
-            >
-              GitHub Repository
-              <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-          </div>
+          <a
+            href={bundle?.repoUrl || 'https://github.com/NishantJh/immich_autoalbums'}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline whitespace-nowrap shrink-0"
+          >
+            GitHub Repository
+            <ExternalLink className="h-3.5 w-3.5" />
+          </a>
         </div>
 
         {/* 4-Step Unraid Release Checklist */}
