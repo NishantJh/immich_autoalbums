@@ -1,0 +1,6 @@
+{
+  "name": "ChromaCluster — Immich Smart Album Organizer",
+  "description": "Spatiotemporal event clustering, CIELAB color-tone scene splitting, and human-in-the-loop album organizer sidecar for Immich photo libraries.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

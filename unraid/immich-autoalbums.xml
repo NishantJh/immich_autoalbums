@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>immich-autoalbums</Name>
+  <Repository>ghcr.io/nishantjh/immich_autoalbums:latest</Repository>
+  <Registry>https://github.com/NishantJh/immich_autoalbums/pkgs/container/immich_autoalbums</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/NishantJh/immich_autoalbums/issues</Support>
+  <Project>https://github.com/NishantJh/immich_autoalbums</Project>
+  <Overview>Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
+  <Category>MediaApp:Photos Tools:</Category>
+  <WebUI>http://[IP]:[PORT:3000]</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/unraid/immich-autoalbums.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.svg</Icon>
+  <ExtraParams>--restart=unless-stopped</ExtraParams>
+  <Requires>An active Immich server and an Immich API key created under Account Settings -&gt; API Keys.</Requires>
+  <Config Name="Web UI Port" Target="3000" Default="3000" Mode="tcp" Description="Port for the ChromaCluster review dashboard." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
+  <Config Name="AppData Directory" Target="/app/data" Default="/mnt/user/appdata/immich-autoalbums" Mode="rw" Description="Persistent storage for the SQLite CIELAB feature cache, thumbnails, and sync ledger." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/immich-autoalbums</Config>
+  <Config Name="Immich Server URL" Target="IMMICH_URL" Default="http://192.168.1.50:2283" Mode="" Description="Base URL of your Immich server (e.g. http://immich:2283 or https://photos.yourdomain.com)." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Immich API Key" Target="IMMICH_API_KEY" Default="" Mode="" Description="Immich API key with asset read, smart search, and album write permissions." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Scan Interval (Hours)" Target="SCAN_INTERVAL_HOURS" Default="6" Mode="" Description="Background incremental scan interval in hours." Type="Variable" Display="always" Required="false" Mask="false">6</Config>
+  <Config Name="Data Directory" Target="DATA_DIR" Default="/app/data" Mode="" Description="Internal container path for SQLite storage." Type="Variable" Display="advanced" Required="true" Mask="false">/app/data</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="Unraid user ID (nobody = 99)." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Unraid group ID (users = 100)." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+</Container>
