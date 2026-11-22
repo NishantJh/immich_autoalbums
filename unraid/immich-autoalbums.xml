@@ -8,6 +8,8 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/NishantJh/immich_autoalbums/issues</Support>
   <Project>https://github.com/NishantJh/immich_autoalbums</Project>
+  <ReadMe>https://github.com/NishantJh/immich_autoalbums#readme</ReadMe>
+  <License>MIT</License>
   <Overview>Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:3000]</WebUI>

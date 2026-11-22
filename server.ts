@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import {
   decodeImageBufferToRgba,
   extractColorFeaturesFromPixels,
@@ -74,6 +73,8 @@ function buildUnraidXml(scanIntervalHours: number): string {
   <Privileged>false</Privileged>
   <Support>${REPO_URL}/issues</Support>
   <Project>${REPO_URL}</Project>
+  <ReadMe>${REPO_URL}#readme</ReadMe>
+  <License>MIT</License>
   <Overview>Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:3000]</WebUI>
@@ -97,8 +98,8 @@ function buildDockerfileText(): string {
   return `FROM node:22-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache python3 make g++
-COPY package*.json ./
-RUN npm ci
+COPY package.json ./
+RUN npm install --legacy-peer-deps --no-audit --no-fund
 COPY . .
 RUN npm run build
 
@@ -107,14 +108,22 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV DATA_DIR=/app/data
+
+LABEL org.opencontainers.image.title="${REPO_NAME}"
+LABEL org.opencontainers.image.description="Smart Event & CIELAB Color-Tone Album Organizer sidecar for Immich"
+LABEL org.opencontainers.image.source="${REPO_URL}"
+LABEL org.opencontainers.image.url="${REPO_URL}"
+LABEL org.opencontainers.image.licenses="MIT"
+
 RUN apk add --no-cache python3 make g++
-COPY package*.json ./
-RUN npm ci --omit=dev && npm install --no-save tsx
+COPY package.json ./
+RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund && npm install --no-save --legacy-peer-deps tsx
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/src/server ./src/server
 COPY --from=builder /app/src/shared ./src/shared
 COPY --from=builder /app/public ./public
+COPY --from=builder /app/LICENSE ./LICENSE
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 EXPOSE 3000
@@ -520,9 +529,13 @@ async function startServer() {
     }
   });
 
-  // Deployment bundle (Unraid Community Apps XML, docker-compose.yml, Dockerfile, GitHub Actions, config.yaml)
+  // Deployment bundle (Unraid Community Apps XML, docker-compose.yml, Dockerfile, GitHub Actions, LICENSE, config.yaml)
   app.get('/api/deploy/bundle', (_req, res) => {
     const settings = getSettings();
+    const licensePath = path.resolve(process.cwd(), 'LICENSE');
+    const licenseText = fs.existsSync(licensePath)
+      ? fs.readFileSync(licensePath, 'utf8')
+      : 'MIT License';
     res.json({
       repoUrl: REPO_URL,
       imageRef: IMAGE_REF,
@@ -531,6 +544,7 @@ async function startServer() {
         dockerCompose: buildDockerComposeYaml(settings.scanIntervalHours),
         dockerfile: buildDockerfileText(),
         githubWorkflow: buildGithubWorkflowYaml(),
+        license: licenseText,
         configYaml: settingsToYaml(settings),
       },
     });
@@ -539,6 +553,7 @@ async function startServer() {
   // Vite dev middleware vs production dist static serving
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

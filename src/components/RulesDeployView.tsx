@@ -10,6 +10,7 @@ interface DeployBundle {
     dockerCompose: string;
     dockerfile: string;
     githubWorkflow: string;
+    license: string;
     configYaml: string;
   };
 }
@@ -24,7 +25,13 @@ interface RulesDeployViewProps {
   }) => Promise<void>;
 }
 
-type BundleTab = 'unraidXml' | 'dockerCompose' | 'dockerfile' | 'githubWorkflow' | 'configYaml';
+type BundleTab =
+  | 'unraidXml'
+  | 'dockerCompose'
+  | 'dockerfile'
+  | 'githubWorkflow'
+  | 'license'
+  | 'configYaml';
 
 const BUNDLE_META: Record<BundleTab, { label: string; fileName: string; mime: string }> = {
   unraidXml: {
@@ -46,6 +53,11 @@ const BUNDLE_META: Record<BundleTab, { label: string; fileName: string; mime: st
     label: 'GHCR Action',
     fileName: 'docker-publish.yml',
     mime: 'text/yaml',
+  },
+  license: {
+    label: 'LICENSE',
+    fileName: 'LICENSE',
+    mime: 'text/plain',
   },
   configYaml: {
     label: 'config.yaml',

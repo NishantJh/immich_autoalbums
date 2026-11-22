@@ -1,8 +1,8 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache python3 make g++
-COPY package*.json ./
-RUN npm ci
+COPY package.json ./
+RUN npm install --legacy-peer-deps --no-audit --no-fund
 COPY . .
 RUN npm run build
 
@@ -11,14 +11,22 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV DATA_DIR=/app/data
+
+LABEL org.opencontainers.image.title="immich-autoalbums"
+LABEL org.opencontainers.image.description="Smart Event & CIELAB Color-Tone Album Organizer sidecar for Immich"
+LABEL org.opencontainers.image.source="https://github.com/NishantJh/immich_autoalbums"
+LABEL org.opencontainers.image.url="https://github.com/NishantJh/immich_autoalbums"
+LABEL org.opencontainers.image.licenses="MIT"
+
 RUN apk add --no-cache python3 make g++
-COPY package*.json ./
-RUN npm ci --omit=dev && npm install --no-save tsx
+COPY package.json ./
+RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund && npm install --no-save --legacy-peer-deps tsx
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/src/server ./src/server
 COPY --from=builder /app/src/shared ./src/shared
 COPY --from=builder /app/public ./public
+COPY --from=builder /app/LICENSE ./LICENSE
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 EXPOSE 3000
