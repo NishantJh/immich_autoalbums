@@ -72,7 +72,7 @@ function buildDockerComposeYaml(scanIntervalHours: number): string {
 function buildUnraidXml(scanIntervalHours: number): string {
   return `<?xml version="1.0"?>
 <Container version="2">
-  <Name>immich-autoalbums</Name>
+  <Name>immich_chromacluster</Name>
   <Repository>${IMAGE_REF}</Repository>
   <Registry>${REPO_URL}/pkgs/container/${REPO_NAME}</Registry>
   <Network>bridge</Network>
@@ -82,7 +82,7 @@ function buildUnraidXml(scanIntervalHours: number): string {
   <Project>${REPO_URL}</Project>
   <ReadMe>${REPO_URL}#readme</ReadMe>
   <License>MIT</License>
-  <Overview>Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
+  <Overview>ChromaCluster — Smart Event and CIELAB Color-Tone Album Organizer sidecar for Immich. Combines 5 km home-base spatiotemporal clustering, HDBSCAN-style local event detection, sliding-window CIELAB Earth Mover's Distance scene splitting, and human-in-the-loop flat-album review.</Overview>
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:3000]</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/unraid/immich-autoalbums.xml</TemplateURL>
@@ -90,7 +90,7 @@ function buildUnraidXml(scanIntervalHours: number): string {
   <ExtraParams>--restart=unless-stopped</ExtraParams>
   <Requires>An active Immich server and an Immich API key created under Account Settings -&gt; API Keys.</Requires>
   <Config Name="Web UI Port" Target="3000" Default="3000" Mode="tcp" Description="Port for the ChromaCluster review dashboard." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
-  <Config Name="AppData Directory" Target="/app/data" Default="/mnt/user/appdata/immich-autoalbums" Mode="rw" Description="Persistent storage for the SQLite CIELAB feature cache, thumbnails, and sync ledger." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/immich-autoalbums</Config>
+  <Config Name="AppData Directory" Target="/app/data" Default="/mnt/user/appdata/immich_chromacluster" Mode="rw" Description="Persistent storage for the SQLite CIELAB feature cache, thumbnails, and sync ledger." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/immich_chromacluster</Config>
   <Config Name="Immich Server URL" Target="IMMICH_URL" Default="http://192.168.1.50:2283" Mode="" Description="Base URL of your Immich server (e.g. http://immich:2283 or https://photos.yourdomain.com)." Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="Immich API Key" Target="IMMICH_API_KEY" Default="" Mode="" Description="Immich API key with asset read, smart search, and album write permissions." Type="Variable" Display="always" Required="true" Mask="true"/>
   <Config Name="Scan Interval (Hours)" Target="SCAN_INTERVAL_HOURS" Default="${scanIntervalHours}" Mode="" Description="Background incremental scan interval in hours." Type="Variable" Display="always" Required="false" Mask="false">${scanIntervalHours}</Config>
