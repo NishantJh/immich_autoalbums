@@ -18,7 +18,14 @@ import {
   settingsToYaml,
   THUMBNAIL_DIR,
 } from './src/server/db.ts';
-import { checkImmichStatus, ingestFromLiveImmich } from './src/server/immichClient.ts';
+import {
+  checkImmichStatus,
+  clearSavedImmichConnection,
+  ingestFromLiveImmich,
+  probeImmichConnection,
+  saveImmichConnection,
+  validateImmichUrl,
+} from './src/server/immichClient.ts';
 import {
   mergeClusters,
   runFullPipeline,
@@ -223,10 +230,52 @@ async function startServer() {
     }
   });
 
-  // Immich server status (read-only; credentials never leave the server)
+  // Immich server status (read-only; raw key never leaves the server)
   app.get('/api/immich/status', async (_req, res) => {
     const status = await checkImmichStatus();
     res.json(status);
+  });
+
+  // Test or save Immich Server URL & API Key (encrypted at rest on server; never echoed back)
+  app.post('/api/immich/config', async (req, res) => {
+    try {
+      const { url, apiKey, testOnly } = req.body as {
+        url?: string;
+        apiKey?: string;
+        testOnly?: boolean;
+      };
+      const { baseUrl } = validateImmichUrl(String(url || ''));
+
+      if (testOnly) {
+        const cleanKey = String(apiKey || '').trim();
+        if (!cleanKey) {
+          // If testing an already-saved URL without retyping key, check status directly
+          const current = await checkImmichStatus();
+          if (current.configured && current.baseUrl === baseUrl) {
+            res.json({ status: current, probe: current });
+            return;
+          }
+          res.status(400).json({ error: 'Enter an Immich API key to test.' });
+          return;
+        }
+        const probe = await probeImmichConnection(baseUrl, cleanKey);
+        res.json({ probe });
+        return;
+      }
+
+      const status = await saveImmichConnection(baseUrl, apiKey);
+      res.json({ status });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to configure Immich connection',
+      });
+    }
+  });
+
+  // Clear saved Immich credentials and return to Safe Demo Sandbox (or env fallback)
+  app.delete('/api/immich/config', async (_req, res) => {
+    const status = await clearSavedImmichConnection();
+    res.json({ status });
   });
 
   // Pull assets from a configured live Immich server & run clustering
@@ -529,18 +578,23 @@ async function startServer() {
     }
   });
 
-  // Deployment bundle (Unraid Community Apps XML, docker-compose.yml, Dockerfile, GitHub Actions, LICENSE, config.yaml)
+  // Deployment bundle (Unraid Community Apps XML, ca_profile.xml, docker-compose.yml, Dockerfile, GitHub Actions, LICENSE, config.yaml)
   app.get('/api/deploy/bundle', (_req, res) => {
     const settings = getSettings();
     const licensePath = path.resolve(process.cwd(), 'LICENSE');
     const licenseText = fs.existsSync(licensePath)
       ? fs.readFileSync(licensePath, 'utf8')
       : 'MIT License';
+    const caProfilePath = path.resolve(process.cwd(), 'ca_profile.xml');
+    const caProfileXml = fs.existsSync(caProfilePath)
+      ? fs.readFileSync(caProfilePath, 'utf8')
+      : '';
     res.json({
       repoUrl: REPO_URL,
       imageRef: IMAGE_REF,
       files: {
         unraidXml: buildUnraidXml(settings.scanIntervalHours),
+        caProfileXml,
         dockerCompose: buildDockerComposeYaml(settings.scanIntervalHours),
         dockerfile: buildDockerfileText(),
         githubWorkflow: buildGithubWorkflowYaml(),

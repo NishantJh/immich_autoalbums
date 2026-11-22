@@ -177,7 +177,10 @@ export interface SyncHistoryRecord {
 export interface ImmichStatus {
   configured: boolean;
   reachable: boolean;
+  source: 'env' | 'saved' | null;
+  baseUrl: string | null;
   hostLabel: string | null;
+  maskedApiKey: string | null;
   serverVersion: string | null;
   lastError: string | null;
 }

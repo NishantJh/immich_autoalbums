@@ -7,6 +7,7 @@ interface DeployBundle {
   imageRef: string;
   files: {
     unraidXml: string;
+    caProfileXml: string;
     dockerCompose: string;
     dockerfile: string;
     githubWorkflow: string;
@@ -27,6 +28,7 @@ interface RulesDeployViewProps {
 
 type BundleTab =
   | 'unraidXml'
+  | 'caProfileXml'
   | 'dockerCompose'
   | 'dockerfile'
   | 'githubWorkflow'
@@ -37,6 +39,11 @@ const BUNDLE_META: Record<BundleTab, { label: string; fileName: string; mime: st
   unraidXml: {
     label: 'Unraid CA XML',
     fileName: 'immich-autoalbums.xml',
+    mime: 'application/xml',
+  },
+  caProfileXml: {
+    label: 'ca_profile.xml',
+    fileName: 'ca_profile.xml',
     mime: 'application/xml',
   },
   dockerCompose: {

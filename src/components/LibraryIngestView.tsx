@@ -1,6 +1,16 @@
 import exifr from 'exifr';
-import { CloudDownload, ImagePlus, RotateCcw, Server } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import {
+  CloudDownload,
+  Eye,
+  EyeOff,
+  ImagePlus,
+  PlugZap,
+  RotateCcw,
+  Save,
+  Server,
+  Unplug,
+} from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { AssetRecord, ImmichStatus } from '../shared/types.ts';
 import { PaletteBar } from './PaletteBar.tsx';
 
@@ -25,6 +35,13 @@ interface LibraryIngestViewProps {
       thumbnailDataUrl: string;
     }>
   ) => Promise<void>;
+  onSaveImmichConfig: (url: string, apiKey: string) => Promise<void>;
+  onTestImmichConfig: (url: string, apiKey: string) => Promise<{
+    reachable: boolean;
+    serverVersion: string | null;
+    lastError: string | null;
+  }>;
+  onDisconnectImmich: () => Promise<void>;
   onIngestImmich: () => Promise<void>;
   onResetSample: () => Promise<void>;
 }
@@ -62,6 +79,9 @@ export function LibraryIngestView({
   immichStatus,
   busyAction,
   onUploadPhotos,
+  onSaveImmichConfig,
+  onTestImmichConfig,
+  onDisconnectImmich,
   onIngestImmich,
   onResetSample,
 }: LibraryIngestViewProps) {
@@ -70,6 +90,20 @@ export function LibraryIngestView({
   const [uploadCity, setUploadCity] = useState('');
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
+
+  const [immichUrl, setImmichUrl] = useState(immichStatus.baseUrl || '');
+  const [immichApiKey, setImmichApiKey] = useState('');
+  const [showKey, setShowKey] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    reachable: boolean;
+    message: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (immichStatus.baseUrl) {
+      setImmichUrl(immichStatus.baseUrl);
+    }
+  }, [immichStatus.baseUrl]);
 
   const filtered = useMemo(() => {
     return assets.filter((a) => {
@@ -140,79 +174,203 @@ export function LibraryIngestView({
         {/* Live Immich Server Connection */}
         <section className="flex flex-col justify-between rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] p-6">
           <div>
-            <div className="flex items-center gap-2.5">
-              <Server className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
-              <h2 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
-                Immich REST API Connection
-              </h2>
-            </div>
-
-            <div className="mt-4 space-y-2 text-xs">
-              <div className="flex items-center justify-between border-b border-neutral-100 dark:border-neutral-800/80 pb-2">
-                <span className="text-neutral-500 dark:text-neutral-400">Connection status</span>
-                <span
-                  className={`font-medium ${
-                    immichStatus.reachable
-                      ? 'text-emerald-700 dark:text-emerald-400'
-                      : immichStatus.configured
-                        ? 'text-amber-700 dark:text-amber-400'
-                        : 'text-neutral-700 dark:text-neutral-300'
-                  }`}
-                >
-                  {immichStatus.reachable
-                    ? `Connected (${immichStatus.serverVersion || 'live'})`
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <Server className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
+                <h2 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
+                  Immich Server Connection
+                </h2>
+              </div>
+              <span
+                className={`text-xs font-medium ${
+                  immichStatus.reachable
+                    ? 'text-emerald-700 dark:text-emerald-400'
                     : immichStatus.configured
-                      ? 'Configured but unreachable'
-                      : 'Local SQLite workspace'}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between border-b border-neutral-100 dark:border-neutral-800/80 pb-2">
-                <span className="text-neutral-500 dark:text-neutral-400">Configured host</span>
-                <span className="font-mono text-neutral-900 dark:text-neutral-100">
-                  {immichStatus.hostLabel || 'Set IMMICH_URL on server'}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between">
-                <span className="text-neutral-500 dark:text-neutral-400">API key boundary</span>
-                <span className="text-neutral-700 dark:text-neutral-300">
-                  Server environment only (IMMICH_API_KEY)
-                </span>
-              </div>
+                      ? 'text-amber-700 dark:text-amber-400'
+                      : 'text-neutral-500 dark:text-neutral-400'
+                }`}
+              >
+                {immichStatus.reachable
+                  ? `Connected (${immichStatus.serverVersion || 'live'})`
+                  : immichStatus.configured
+                    ? 'Unreachable'
+                    : 'Safe Demo Mode'}
+              </span>
             </div>
 
-            {immichStatus.lastError && (
-              <p className="mt-3 text-xs text-rose-600 dark:text-rose-400">
+            <div className="mt-3 space-y-1.5 text-xs border-b border-neutral-100 dark:border-neutral-800/80 pb-3">
+              <div className="flex items-center justify-between">
+                <span className="text-neutral-500 dark:text-neutral-400">Credential source</span>
+                <span className="font-medium text-neutral-800 dark:text-neutral-200">
+                  {immichStatus.source === 'saved'
+                    ? 'Saved in app (AES-256 encrypted on server)'
+                    : immichStatus.source === 'env'
+                      ? 'Container environment variables'
+                      : 'None — local demo library active'}
+                </span>
+              </div>
+              {immichStatus.maskedApiKey && (
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-500 dark:text-neutral-400">Saved API key</span>
+                  <span className="font-mono text-neutral-800 dark:text-neutral-200">
+                    {immichStatus.maskedApiKey}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <label className="block space-y-1">
+                <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
+                  Immich Server URL
+                </span>
+                <input
+                  type="url"
+                  value={immichUrl}
+                  onChange={(e) => {
+                    setImmichUrl(e.target.value);
+                    setTestResult(null);
+                  }}
+                  placeholder="http://192.168.1.50:2283 or https://photos.yourdomain.com"
+                  className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-neutral-50/60 dark:bg-[#0B0E14] px-3 py-2 text-xs font-mono text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                />
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
+                  Immich API Key
+                </span>
+                <div className="relative">
+                  <input
+                    type={showKey ? 'text' : 'password'}
+                    value={immichApiKey}
+                    onChange={(e) => {
+                      setImmichApiKey(e.target.value);
+                      setTestResult(null);
+                    }}
+                    placeholder={
+                      immichStatus.configured
+                        ? 'Saved key active (enter new key to replace)'
+                        : 'Paste key from Immich Account Settings -> API Keys'
+                    }
+                    autoComplete="off"
+                    className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-neutral-50/60 dark:bg-[#0B0E14] pl-3 pr-9 py-2 text-xs font-mono text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowKey((prev) => !prev)}
+                    aria-label={showKey ? 'Hide API key' : 'Show API key'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+                  >
+                    {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              </label>
+            </div>
+
+            {testResult && (
+              <p
+                className={`mt-2.5 text-xs ${
+                  testResult.reachable
+                    ? 'text-emerald-700 dark:text-emerald-400'
+                    : 'text-rose-600 dark:text-rose-400'
+                }`}
+              >
+                {testResult.message}
+              </p>
+            )}
+
+            {!testResult && immichStatus.lastError && (
+              <p className="mt-2.5 text-xs text-rose-600 dark:text-rose-400">
                 {immichStatus.lastError}
               </p>
             )}
 
-            <p className="mt-4 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-              In Unraid or Docker Compose, pass <code className="font-mono text-neutral-800 dark:text-neutral-200">IMMICH_URL</code> and{' '}
-              <code className="font-mono text-neutral-800 dark:text-neutral-200">IMMICH_API_KEY</code> as container environment variables. Credentials never reach the browser.
+            <p className="mt-3 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
+              Saving credentials only verifies server reachability—nothing is pulled or written to your Immich library until you click{' '}
+              <strong className="font-medium text-neutral-700 dark:text-neutral-300">
+                Pull &amp; Scan from Immich
+              </strong>{' '}
+              or approve an album sync.
             </p>
           </div>
 
-          <div className="mt-5 flex flex-wrap items-center gap-2.5 pt-4 border-t border-neutral-100 dark:border-neutral-800/80">
+          <div className="mt-4 flex flex-wrap items-center gap-2 pt-4 border-t border-neutral-100 dark:border-neutral-800/80">
+            <button
+              type="button"
+              disabled={!immichUrl.trim() || busyAction !== null}
+              onClick={async () => {
+                setTestResult(null);
+                try {
+                  const res = await onTestImmichConfig(immichUrl.trim(), immichApiKey.trim());
+                  setTestResult({
+                    reachable: res.reachable,
+                    message: res.reachable
+                      ? `Reachable (${res.serverVersion || 'connected'})`
+                      : res.lastError || 'Could not reach Immich server',
+                  });
+                } catch (err) {
+                  setTestResult({
+                    reachable: false,
+                    message: err instanceof Error ? err.message : 'Test failed',
+                  });
+                }
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 disabled:opacity-45 whitespace-nowrap shrink-0"
+            >
+              <PlugZap className="h-3.5 w-3.5" />
+              Test
+            </button>
+
+            <button
+              type="button"
+              disabled={!immichUrl.trim() || (!immichApiKey.trim() && !immichStatus.configured) || busyAction !== null}
+              onClick={async () => {
+                setTestResult(null);
+                await onSaveImmichConfig(immichUrl.trim(), immichApiKey.trim());
+                setImmichApiKey('');
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 dark:bg-neutral-100 px-3.5 py-2 text-xs font-medium text-white dark:text-neutral-900 hover:opacity-90 disabled:opacity-45 whitespace-nowrap shrink-0"
+            >
+              <Save className="h-3.5 w-3.5" />
+              {busyAction === 'immich-save' ? 'Saving...' : 'Save Connection'}
+            </button>
+
+            {immichStatus.source === 'saved' && (
+              <button
+                type="button"
+                disabled={busyAction !== null}
+                onClick={async () => {
+                  setTestResult(null);
+                  await onDisconnectImmich();
+                  setImmichUrl('');
+                  setImmichApiKey('');
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 whitespace-nowrap shrink-0"
+              >
+                <Unplug className="h-3.5 w-3.5" />
+                Disconnect
+              </button>
+            )}
+
             <button
               type="button"
               disabled={!immichStatus.reachable || busyAction !== null}
               onClick={onIngestImmich}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-45 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-45 whitespace-nowrap shrink-0"
             >
               <CloudDownload className="h-3.5 w-3.5" />
-              {busyAction === 'immich-ingest' ? 'Pulling from Immich...' : 'Pull & Scan from Immich'}
+              {busyAction === 'immich-ingest' ? 'Pulling...' : 'Pull & Scan from Immich'}
             </button>
 
             <button
               type="button"
               disabled={busyAction !== null}
               onClick={onResetSample}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3.5 py-2 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              Reset Sample Library
+              Reset Demo
             </button>
           </div>
         </section>

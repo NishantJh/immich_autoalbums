@@ -82,7 +82,10 @@ export default function App() {
   const [immichStatus, setImmichStatus] = useState<ImmichStatus>({
     configured: false,
     reachable: false,
+    source: null,
+    baseUrl: null,
     hostLabel: null,
+    maskedApiKey: null,
     serverVersion: null,
     lastError: null,
   });
@@ -409,6 +412,65 @@ export default function App() {
       notify(`Ingested ${data.inserted} local photos and extracted real CIELAB palettes.`);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Upload failed', 'err');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleTestImmichConfig = async (url: string, apiKey: string) => {
+    const res = await fetch('/api/immich/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, apiKey, testOnly: true }),
+    });
+    const data = (await res.json()) as {
+      error?: string;
+      probe?: {
+        reachable: boolean;
+        serverVersion: string | null;
+        lastError: string | null;
+      };
+    };
+    if (!res.ok || !data.probe) {
+      throw new Error(data.error || 'Connection test failed');
+    }
+    return data.probe;
+  };
+
+  const handleSaveImmichConfig = async (url: string, apiKey: string) => {
+    setBusyId('immich-save');
+    try {
+      const res = await fetch('/api/immich/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, apiKey }),
+      });
+      const data = (await res.json()) as { error?: string; status?: ImmichStatus };
+      if (!res.ok || !data.status) {
+        throw new Error(data.error || 'Failed to save Immich connection');
+      }
+      setImmichStatus(data.status);
+      notify(
+        data.status.reachable
+          ? `Immich connection saved (${data.status.serverVersion || 'connected'}).`
+          : 'Immich URL & API key saved on server (server currently unreachable).'
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to save Immich connection', 'err');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleDisconnectImmich = async () => {
+    setBusyId('immich-disconnect');
+    try {
+      const res = await fetch('/api/immich/config', { method: 'DELETE' });
+      const data = (await res.json()) as { status: ImmichStatus };
+      setImmichStatus(data.status);
+      notify('Saved Immich credentials cleared. Returned to Safe Demo Sandbox.');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Failed to clear credentials', 'err');
     } finally {
       setBusyId(null);
     }
@@ -802,6 +864,9 @@ export default function App() {
                   immichStatus={immichStatus}
                   busyAction={busyId}
                   onUploadPhotos={handleUploadPhotos}
+                  onSaveImmichConfig={handleSaveImmichConfig}
+                  onTestImmichConfig={handleTestImmichConfig}
+                  onDisconnectImmich={handleDisconnectImmich}
                   onIngestImmich={handleIngestImmich}
                   onResetSample={handleResetSample}
                 />

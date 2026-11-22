@@ -1,35 +1,211 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { ImmichStatus } from '../shared/types.ts';
-import { getDb, THUMBNAIL_DIR } from './db.ts';
+import { DATA_DIR, getDb, THUMBNAIL_DIR } from './db.ts';
 
-function getConfiguredImmich(): { baseUrl: string; apiKey: string; hostLabel: string } | null {
-  const rawUrl = (process.env.IMMICH_URL || '').trim().replace(/\/+$/, '');
-  const apiKey = (process.env.IMMICH_API_KEY || '').trim();
-  if (!rawUrl || !apiKey) return null;
+interface StoredImmichConfig {
+  baseUrl: string;
+  iv: string;
+  tag: string;
+  ciphertext: string;
+  updatedAt: string;
+}
 
+function getEncryptionKey(): Buffer {
+  const envSecret = (process.env.IMMICH_CONFIG_SECRET || '').trim();
+  if (envSecret) {
+    return crypto.createHash('sha256').update(envSecret).digest();
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const keyFile = path.join(DATA_DIR, '.config.key');
+  if (fs.existsSync(keyFile)) {
+    const raw = fs.readFileSync(keyFile, 'utf8').trim();
+    const buf = Buffer.from(raw, 'hex');
+    if (buf.length === 32) return buf;
+  }
+  const fresh = crypto.randomBytes(32);
+  fs.writeFileSync(keyFile, fresh.toString('hex'), { mode: 0o600 });
+  return fresh;
+}
+
+function encryptSecret(plaintext: string): { iv: string; tag: string; ciphertext: string } {
+  const key = getEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    iv: iv.toString('hex'),
+    tag: tag.toString('hex'),
+    ciphertext: enc.toString('hex'),
+  };
+}
+
+function decryptSecret(payload: { iv: string; tag: string; ciphertext: string }): string | null {
   try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return null;
-    }
-    return {
-      baseUrl: `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, ''),
-      apiKey,
-      hostLabel: parsed.host,
-    };
+    const key = getEncryptionKey();
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      key,
+      Buffer.from(payload.iv, 'hex')
+    );
+    decipher.setAuthTag(Buffer.from(payload.tag, 'hex'));
+    const dec = Buffer.concat([
+      decipher.update(Buffer.from(payload.ciphertext, 'hex')),
+      decipher.final(),
+    ]);
+    return dec.toString('utf8');
   } catch {
     return null;
   }
 }
 
-async function immichFetch(
-  apiPath: string,
-  init: RequestInit = {}
-): Promise<Response> {
+export function validateImmichUrl(rawUrl: string): { baseUrl: string; hostLabel: string } {
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    throw new Error('Immich Server URL is required.');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Enter a valid URL starting with http:// or https://');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Immich URL must use http:// or https://');
+  }
+  const hostLower = parsed.hostname.toLowerCase();
+  if (
+    hostLower === '169.254.169.254' ||
+    hostLower.startsWith('169.254.') ||
+    hostLower === 'metadata.google.internal'
+  ) {
+    throw new Error('Blocked metadata host address.');
+  }
+  return {
+    baseUrl: `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, ''),
+    hostLabel: parsed.host,
+  };
+}
+
+function maskKey(apiKey: string): string {
+  const clean = apiKey.trim();
+  if (clean.length <= 4) return '••••';
+  return `••••••••${clean.slice(-4)}`;
+}
+
+function getSavedImmichConfig(): { baseUrl: string; apiKey: string; hostLabel: string } | null {
+  const row = getDb()
+    .prepare('SELECT value_json FROM app_state WHERE key = ?')
+    .get('immich_connection') as { value_json: string } | undefined;
+  if (!row) return null;
+
+  try {
+    const stored = JSON.parse(row.value_json) as StoredImmichConfig;
+    const apiKey = decryptSecret(stored);
+    if (!apiKey) return null;
+    const { baseUrl, hostLabel } = validateImmichUrl(stored.baseUrl);
+    return { baseUrl, apiKey, hostLabel };
+  } catch {
+    return null;
+  }
+}
+
+function getConfiguredImmich(): {
+  baseUrl: string;
+  apiKey: string;
+  hostLabel: string;
+  source: 'env' | 'saved';
+} | null {
+  const saved = getSavedImmichConfig();
+  if (saved) {
+    return { ...saved, source: 'saved' };
+  }
+
+  const rawUrl = (process.env.IMMICH_URL || '').trim().replace(/\/+$/, '');
+  const apiKey = (process.env.IMMICH_API_KEY || '').trim();
+  if (!rawUrl || !apiKey) return null;
+
+  try {
+    const { baseUrl, hostLabel } = validateImmichUrl(rawUrl);
+    return { baseUrl, apiKey, hostLabel, source: 'env' };
+  } catch {
+    return null;
+  }
+}
+
+export async function probeImmichConnection(
+  baseUrl: string,
+  apiKey: string
+): Promise<{ reachable: boolean; serverVersion: string | null; lastError: string | null }> {
+  try {
+    const res = await fetch(`${baseUrl}/api/server/version`, {
+      headers: {
+        'x-api-key': apiKey,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) {
+      return {
+        reachable: false,
+        serverVersion: null,
+        lastError:
+          res.status === 401 || res.status === 403
+            ? 'Immich rejected the API key (HTTP 401/403).'
+            : `HTTP ${res.status} from Immich server`,
+      };
+    }
+    const ver = (await res.json()) as { major?: number; minor?: number; patch?: number };
+    const versionStr =
+      typeof ver.major === 'number' ? `v${ver.major}.${ver.minor ?? 0}.${ver.patch ?? 0}` : 'connected';
+    return { reachable: true, serverVersion: versionStr, lastError: null };
+  } catch (err) {
+    return {
+      reachable: false,
+      serverVersion: null,
+      lastError: err instanceof Error ? err.message : 'Unable to reach Immich server',
+    };
+  }
+}
+
+export async function saveImmichConnection(
+  rawUrl: string,
+  rawApiKey?: string
+): Promise<ImmichStatus> {
+  const { baseUrl } = validateImmichUrl(rawUrl);
+  const existing = getConfiguredImmich();
+  const apiKey = (rawApiKey || '').trim() || existing?.apiKey || '';
+  if (!apiKey) {
+    throw new Error('Immich API key is required.');
+  }
+
+  const encrypted = encryptSecret(apiKey);
+  const payload: StoredImmichConfig = {
+    baseUrl,
+    ...encrypted,
+    updatedAt: new Date().toISOString(),
+  };
+
+  getDb()
+    .prepare(
+      'INSERT INTO app_state (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json'
+    )
+    .run('immich_connection', JSON.stringify(payload));
+
+  return checkImmichStatus();
+}
+
+export async function clearSavedImmichConnection(): Promise<ImmichStatus> {
+  getDb().prepare('DELETE FROM app_state WHERE key = ?').run('immich_connection');
+  return checkImmichStatus();
+}
+
+async function immichFetch(apiPath: string, init: RequestInit = {}): Promise<Response> {
   const cfg = getConfiguredImmich();
   if (!cfg) {
-    throw new Error('Immich server is not configured via IMMICH_URL and IMMICH_API_KEY.');
+    throw new Error('Immich server is not configured.');
   }
 
   const normalizedPath = apiPath.startsWith('/api/')
@@ -56,42 +232,26 @@ export async function checkImmichStatus(): Promise<ImmichStatus> {
     return {
       configured: false,
       reachable: false,
+      source: null,
+      baseUrl: null,
       hostLabel: null,
+      maskedApiKey: null,
       serverVersion: null,
       lastError: null,
     };
   }
 
-  try {
-    const res = await immichFetch('/api/server/version');
-    if (!res.ok) {
-      return {
-        configured: true,
-        reachable: false,
-        hostLabel: cfg.hostLabel,
-        serverVersion: null,
-        lastError: `HTTP ${res.status} from Immich server`,
-      };
-    }
-    const ver = (await res.json()) as { major?: number; minor?: number; patch?: number };
-    const versionStr =
-      typeof ver.major === 'number' ? `v${ver.major}.${ver.minor ?? 0}.${ver.patch ?? 0}` : 'connected';
-    return {
-      configured: true,
-      reachable: true,
-      hostLabel: cfg.hostLabel,
-      serverVersion: versionStr,
-      lastError: null,
-    };
-  } catch (err) {
-    return {
-      configured: true,
-      reachable: false,
-      hostLabel: cfg.hostLabel,
-      serverVersion: null,
-      lastError: err instanceof Error ? err.message : 'Unable to reach Immich server',
-    };
-  }
+  const probe = await probeImmichConnection(cfg.baseUrl, cfg.apiKey);
+  return {
+    configured: true,
+    reachable: probe.reachable,
+    source: cfg.source,
+    baseUrl: cfg.baseUrl,
+    hostLabel: cfg.hostLabel,
+    maskedApiKey: maskKey(cfg.apiKey),
+    serverVersion: probe.serverVersion,
+    lastError: probe.lastError,
+  };
 }
 
 interface ImmichSearchItem {
