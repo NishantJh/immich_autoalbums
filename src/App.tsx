@@ -142,20 +142,46 @@ export default function App() {
 
   const handleRunPipeline = async () => {
     setIsScanning(true);
+    const started = Date.now();
     try {
       const res = await fetch('/api/pipeline/run', { method: 'POST' });
-      if (!res.ok) throw new Error('Pipeline run failed');
       const data = (await res.json()) as {
+        error?: string;
+        mode?: 'live_immich' | 'local_fallback' | 'local_cache';
+        ingested?: number;
+        immichWarning?: string;
+        immichStatus?: ImmichStatus;
         summary: PipelineRunSummary;
         clusters: ClusterRecord[];
         assets: AssetRecord[];
       };
+      if (!res.ok) throw new Error(data.error || 'Pipeline run failed');
+
+      // Ensure brief visible Scanning state even when cached SQLite runs finish in <5 ms
+      const elapsed = Date.now() - started;
+      if (elapsed < 300) {
+        await new Promise((r) => setTimeout(r, 300 - elapsed));
+      }
+
+      if (data.immichStatus) setImmichStatus(data.immichStatus);
       setPipelineSummary(data.summary);
       setClusters(data.clusters);
       setAssets(data.assets);
-      notify(
-        `Scan complete in ${data.summary.durationMs} ms — ${data.clusters.length} album proposals ready.`
-      );
+
+      if (data.mode === 'live_immich') {
+        notify(
+          `Pulled ${data.ingested ?? 0} assets from Immich and scanned in ${data.summary.durationMs} ms — ${data.clusters.length} album proposals ready.`
+        );
+      } else if (data.mode === 'local_fallback') {
+        notify(
+          `Immich unreachable (${data.immichWarning || 'check URL/key'}). Scanned ${data.summary.stage1.eligibleAssets} local cached assets.`,
+          'err'
+        );
+      } else {
+        notify(
+          `Scan complete in ${data.summary.durationMs} ms — evaluated ${data.summary.stage1.eligibleAssets} eligible assets into ${data.clusters.length} album proposals.`
+        );
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Scan failed', 'err');
     } finally {
@@ -166,13 +192,18 @@ export default function App() {
   const handleClearCacheAndRun = async () => {
     setIsScanning(true);
     try {
-      await fetch('/api/pipeline/clear-cache', { method: 'POST' });
+      const clearRes = await fetch('/api/pipeline/clear-cache', { method: 'POST' });
+      if (!clearRes.ok) throw new Error('Failed to clear SQLite LAB cache');
       const res = await fetch('/api/pipeline/run', { method: 'POST' });
       const data = (await res.json()) as {
+        error?: string;
+        immichStatus?: ImmichStatus;
         summary: PipelineRunSummary;
         clusters: ClusterRecord[];
         assets: AssetRecord[];
       };
+      if (!res.ok) throw new Error(data.error || 'Pipeline re-extraction failed');
+      if (data.immichStatus) setImmichStatus(data.immichStatus);
       setPipelineSummary(data.summary);
       setClusters(data.clusters);
       setAssets(data.assets);
@@ -351,24 +382,26 @@ export default function App() {
     }
   };
 
-  const handleSimulateNewPhotos = async () => {
-    setBusyId('simulate');
+  const handleClearLocalCache = async () => {
+    setBusyId('clear-cache');
     try {
-      const res = await fetch('/api/library/simulate-new-photos', { method: 'POST' });
+      const res = await fetch('/api/library/clear', { method: 'POST' });
       const data = (await res.json()) as {
-        added: number;
+        error?: string;
+        cleared: number;
         summary: PipelineRunSummary;
         clusters: ClusterRecord[];
         assets: AssetRecord[];
+        syncHistory: SyncHistoryRecord[];
       };
+      if (!res.ok) throw new Error(data.error || 'Failed to clear local cache');
       setPipelineSummary(data.summary);
       setClusters(data.clusters);
       setAssets(data.assets);
-      notify(
-        `Added ${data.added} new Goa sunset photos. Existing Goa albums now show incremental PUT appends.`
-      );
+      setSyncHistory(data.syncHistory);
+      notify(`Cleared ${data.cleared} cached assets and thumbnails from local storage.`);
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Simulation failed', 'err');
+      notify(err instanceof Error ? err.message : 'Failed to clear cache', 'err');
     } finally {
       setBusyId(null);
     }
@@ -468,7 +501,7 @@ export default function App() {
       const res = await fetch('/api/immich/config', { method: 'DELETE' });
       const data = (await res.json()) as { status: ImmichStatus };
       setImmichStatus(data.status);
-      notify('Saved Immich credentials cleared. Returned to Safe Demo Sandbox.');
+      notify('Saved Immich credentials cleared.');
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to clear credentials', 'err');
     } finally {
@@ -493,29 +526,6 @@ export default function App() {
       notify(`Pulled ${data.ingested} assets from Immich and rebuilt clusters.`);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Immich ingest failed', 'err');
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const handleResetSample = async () => {
-    setBusyId('reset');
-    try {
-      const res = await fetch('/api/library/reset-sample', { method: 'POST' });
-      const data = (await res.json()) as {
-        count: number;
-        summary: PipelineRunSummary;
-        clusters: ClusterRecord[];
-        assets: AssetRecord[];
-        syncHistory: SyncHistoryRecord[];
-      };
-      setPipelineSummary(data.summary);
-      setClusters(data.clusters);
-      setAssets(data.assets);
-      setSyncHistory(data.syncHistory);
-      notify(`Sample library reset (${data.count} assets indexed).`);
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Reset failed', 'err');
     } finally {
       setBusyId(null);
     }
@@ -595,12 +605,14 @@ export default function App() {
 
         <div className="border-t border-neutral-200 dark:border-neutral-800 px-5 py-4 text-xs text-neutral-500 dark:text-neutral-400 space-y-1">
           <div className="font-medium text-neutral-800 dark:text-neutral-200">
-            {immichStatus.reachable ? 'Live Immich Sidecar' : 'Safe Demo Sandbox'}
+            {immichStatus.reachable
+              ? 'Live Immich Sidecar'
+              : immichStatus.configured
+                ? 'Immich Unreachable'
+                : 'Immich Not Connected'}
           </div>
           <div className="truncate font-mono text-[11px]">
-            {immichStatus.reachable
-              ? immichStatus.hostLabel
-              : 'Local SQLite · No Immich writes'}
+            {immichStatus.hostLabel || 'Configure in Library & Ingest'}
           </div>
           <a
             href="https://github.com/NishantJh/immich_autoalbums"
@@ -702,27 +714,28 @@ export default function App() {
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </button>
 
-            {approvedCount > 0 ? (
+            {approvedCount > 0 && (
               <button
                 type="button"
                 disabled={busyId === 'sync-all'}
                 onClick={handleSyncApproved}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 tabular-nums"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 tabular-nums"
               >
                 <UploadCloud className="h-3.5 w-3.5" />
                 {busyId === 'sync-all' ? 'Syncing...' : `Sync Approved (${approvedCount})`}
               </button>
-            ) : (
-              <button
-                type="button"
-                disabled={isScanning}
-                onClick={handleRunPipeline}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Play className="h-3.5 w-3.5" />
-                {isScanning ? 'Scanning...' : 'Run Scan'}
-              </button>
             )}
+
+            <button
+              type="button"
+              disabled={isScanning}
+              aria-busy={isScanning}
+              onClick={handleRunPipeline}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Play className={`h-3.5 w-3.5 ${isScanning ? 'animate-pulse' : ''}`} />
+              {isScanning ? 'Scanning...' : 'Run Scan'}
+            </button>
           </div>
         </header>
 
@@ -832,6 +845,7 @@ export default function App() {
                   onSyncOne={handleSyncOne}
                   onMerge={handleMerge}
                   onSplit={handleSplit}
+                  onOpenLibrary={() => setSection('library')}
                 />
               )}
 
@@ -853,7 +867,6 @@ export default function App() {
                   syncHistory={syncHistory}
                   immichStatus={immichStatus}
                   busyAction={busyId}
-                  onSimulateNewPhotos={handleSimulateNewPhotos}
                   onSyncCluster={handleSyncOne}
                 />
               )}
@@ -868,7 +881,7 @@ export default function App() {
                   onTestImmichConfig={handleTestImmichConfig}
                   onDisconnectImmich={handleDisconnectImmich}
                   onIngestImmich={handleIngestImmich}
-                  onResetSample={handleResetSample}
+                  onClearLocalCache={handleClearLocalCache}
                 />
               )}
 

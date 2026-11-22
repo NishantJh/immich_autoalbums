@@ -7,6 +7,7 @@ import {
   extractColorFeaturesFromPixels,
 } from './src/server/colorLab.ts';
 import {
+  clearLocalLibraryCache,
   getAllAssets,
   getAllClusters,
   getDb,
@@ -14,6 +15,7 @@ import {
   getSettings,
   getSyncHistory,
   parseYamlToSettings,
+  purgeDemoAssets,
   saveSettings,
   settingsToYaml,
   THUMBNAIL_DIR,
@@ -32,10 +34,6 @@ import {
   splitClusterAtIndex,
   syncClusterIdempotent,
 } from './src/server/pipeline.ts';
-import {
-  appendIncrementalTripPhotos,
-  seedSampleLibraryIfEmpty,
-} from './src/server/sampleLibrary.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const REPO_OWNER = 'NishantJh';
@@ -61,6 +59,9 @@ function buildDockerComposeYaml(scanIntervalHours: number): string {
       - TZ=UTC
     volumes:
       - ./appdata:/app/data
+    labels:
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.png"
+      net.unraid.docker.webui: "http://[IP]:[PORT:3000]"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -86,7 +87,7 @@ function buildUnraidXml(scanIntervalHours: number): string {
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:3000]</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/unraid/immich-autoalbums.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.png</Icon>
   <ExtraParams>--restart=unless-stopped</ExtraParams>
   <Requires>An active Immich server and an Immich API key created under Account Settings -&gt; API Keys.</Requires>
   <Config Name="Web UI Port" Target="3000" Default="3000" Mode="tcp" Description="Port for the ChromaCluster review dashboard." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
@@ -121,6 +122,8 @@ LABEL org.opencontainers.image.description="Smart Event & CIELAB Color-Tone Albu
 LABEL org.opencontainers.image.source="${REPO_URL}"
 LABEL org.opencontainers.image.url="${REPO_URL}"
 LABEL org.opencontainers.image.licenses="MIT"
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/public/icon.png"
+LABEL net.unraid.docker.webui="http://[IP]:[PORT:3000]"
 
 RUN apk add --no-cache python3 make g++
 COPY package.json ./
@@ -190,16 +193,18 @@ jobs:
           push: true
           tags: \${{ steps.meta.outputs.tags }}
           labels: \${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 `;
 }
 
 async function startServer() {
-  // Initialize SQLite, seed realistic sample library on first launch, and run initial pipeline
+  // Initialize SQLite, purge any legacy demo assets/thumbnails, and refresh summary if needed
   getDb();
-  const seeded = seedSampleLibraryIfEmpty(false);
-  if (seeded > 0 || !getPipelineSummary()) {
+  const purged = purgeDemoAssets();
+  if (purged > 0 || !getPipelineSummary()) {
     runFullPipeline();
   }
 
@@ -272,7 +277,7 @@ async function startServer() {
     }
   });
 
-  // Clear saved Immich credentials and return to Safe Demo Sandbox (or env fallback)
+  // Clear saved Immich credentials (falls back to env vars if configured)
   app.delete('/api/immich/config', async (_req, res) => {
     const status = await clearSavedImmichConnection();
     res.json({ status });
@@ -316,7 +321,9 @@ async function startServer() {
     }
 
     const ext = path.extname(safeBase).toLowerCase();
-    res.setHeader('Content-Type', ext === '.png' ? 'image/png' : 'image/jpeg');
+    const contentType =
+      ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+    res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.sendFile(resolved);
   });
@@ -427,24 +434,46 @@ async function startServer() {
     }
   });
 
-  // Simulate new trip photos arriving in Immich (tests incremental SQLite cache & idempotent append)
-  app.post('/api/library/simulate-new-photos', (_req, res) => {
-    const added = appendIncrementalTripPhotos();
+  // Clear all locally cached assets, clusters, and thumbnails (never modifies Immich)
+  app.post('/api/library/clear', (_req, res) => {
+    const cleared = clearLocalLibraryCache();
     const run = runFullPipeline();
-    res.json({ added, ...run, assets: getAllAssets() });
+    res.json({ cleared, ...run, assets: getAllAssets(), syncHistory: getSyncHistory() });
   });
 
-  // Reset sample library cleanly
-  app.post('/api/library/reset-sample', (_req, res) => {
-    const count = seedSampleLibraryIfEmpty(true);
-    const run = runFullPipeline();
-    res.json({ count, ...run, assets: getAllAssets(), syncHistory: getSyncHistory() });
-  });
+  // Run 4-Stage Clustering & CIELAB Scene-Split Pipeline (pulls from live Immich when connected)
+  app.post('/api/pipeline/run', async (_req, res) => {
+    try {
+      const immichStatus = await checkImmichStatus();
+      if (immichStatus.configured && immichStatus.reachable) {
+        const ingest = await ingestFromLiveImmich(5);
+        const run = runFullPipeline();
+        res.json({
+          ...run,
+          assets: getAllAssets(),
+          immichStatus,
+          ingested: ingest.ingested,
+          mode: 'live_immich',
+        });
+        return;
+      }
 
-  // Run 4-Stage Clustering & CIELAB Scene-Split Pipeline
-  app.post('/api/pipeline/run', (_req, res) => {
-    const run = runFullPipeline();
-    res.json({ ...run, assets: getAllAssets() });
+      const run = runFullPipeline();
+      res.json({
+        ...run,
+        assets: getAllAssets(),
+        immichStatus,
+        ingested: 0,
+        mode: immichStatus.configured ? 'local_fallback' : 'local_cache',
+        immichWarning: immichStatus.configured
+          ? immichStatus.lastError || 'Configured Immich server is unreachable'
+          : undefined,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Scan pipeline failed',
+      });
+    }
   });
 
   // Clear SQLite LAB feature cache so next run demonstrates fresh pixel extraction

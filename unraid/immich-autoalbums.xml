@@ -14,7 +14,7 @@
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:3000]</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/unraid/immich-autoalbums.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.png</Icon>
   <ExtraParams>--restart=unless-stopped</ExtraParams>
   <Requires>An active Immich server and an Immich API key created under Account Settings -&gt; API Keys.</Requires>
   <Config Name="Web UI Port" Target="3000" Default="3000" Mode="tcp" Description="Port for the ChromaCluster review dashboard." Type="Port" Display="always" Required="true" Mask="false">3000</Config>

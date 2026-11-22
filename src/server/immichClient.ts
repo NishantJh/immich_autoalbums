@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { ImmichStatus } from '../shared/types.ts';
-import { DATA_DIR, getDb, THUMBNAIL_DIR } from './db.ts';
+import { DATA_DIR, getDb, purgeDemoAssets, THUMBNAIL_DIR } from './db.ts';
 
 interface StoredImmichConfig {
   baseUrl: string;
@@ -285,6 +285,30 @@ const OCCASION_PROMPTS = [
   'architecture',
 ];
 
+function isWebpBuffer(buf: Buffer): boolean {
+  return (
+    buf.length >= 12 &&
+    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buf.subarray(8, 12).toString('ascii') === 'WEBP'
+  );
+}
+
+function isPngBuffer(buf: Buffer): boolean {
+  return (
+    buf.length >= 8 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47
+  );
+}
+
+function detectThumbExt(buf: Buffer): 'png' | 'webp' | 'jpg' {
+  if (isPngBuffer(buf)) return 'png';
+  if (isWebpBuffer(buf)) return 'webp';
+  return 'jpg';
+}
+
 /**
  * Ingests metadata, thumbnails, and CLIP Smart Search tags from a configured live Immich instance.
  */
@@ -302,14 +326,23 @@ export async function ingestFromLiveImmich(maxPages = 5): Promise<{
   const albumsRes = await immichFetch('/api/albums');
   if (albumsRes.ok) {
     const albums = (await albumsRes.json()) as Array<{ id: string }>;
-    for (const album of albums.slice(0, 40)) {
-      const detailRes = await immichFetch(`/api/albums/${encodeURIComponent(album.id)}`);
-      if (detailRes.ok) {
-        const detail = (await detailRes.json()) as { assets?: Array<{ id: string }> };
-        for (const a of detail.assets || []) {
-          alreadyAlbumedIds.add(a.id);
-        }
-      }
+    for (let i = 0; i < Math.min(albums.length, 40); i += 6) {
+      const batch = albums.slice(i, i + 6);
+      await Promise.all(
+        batch.map(async (album) => {
+          try {
+            const detailRes = await immichFetch(`/api/albums/${encodeURIComponent(album.id)}`);
+            if (detailRes.ok) {
+              const detail = (await detailRes.json()) as { assets?: Array<{ id: string }> };
+              for (const a of detail.assets || []) {
+                alreadyAlbumedIds.add(a.id);
+              }
+            }
+          } catch {
+            // Non-fatal
+          }
+        })
+      );
     }
   }
 
@@ -329,7 +362,15 @@ export async function ingestFromLiveImmich(maxPages = 5): Promise<{
         size: 100,
       }),
     });
-    if (!res.ok) break;
+    if (!res.ok) {
+      if (page === 1) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(
+          `Immich /api/search/metadata failed (HTTP ${res.status})${errText ? `: ${errText.slice(0, 140)}` : ''}`
+        );
+      }
+      break;
+    }
     const payload = (await res.json()) as {
       assets?: { items?: ImmichSearchItem[]; nextPage?: string | null };
     };
@@ -341,33 +382,94 @@ export async function ingestFromLiveImmich(maxPages = 5): Promise<{
   // 3. Query CLIP Smart Search occasion prompts and intersect asset IDs
   const tagMap = new Map<string, Set<string>>();
   let smartTagsMatched = 0;
-  for (const prompt of OCCASION_PROMPTS) {
-    try {
-      const smartRes = await immichFetch('/api/search/smart', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: prompt,
-          type: 'IMAGE',
-          size: 100,
-        }),
-      });
-      if (!smartRes.ok) continue;
-      const payload = (await smartRes.json()) as { assets?: { items?: Array<{ id: string }> } };
-      for (const item of payload.assets?.items || []) {
-        if (!tagMap.has(item.id)) tagMap.set(item.id, new Set());
-        tagMap.get(item.id)!.add(prompt);
-        smartTagsMatched++;
+  await Promise.all(
+    OCCASION_PROMPTS.map(async (prompt) => {
+      try {
+        const smartRes = await immichFetch('/api/search/smart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: prompt,
+            type: 'IMAGE',
+            size: 100,
+          }),
+        });
+        if (!smartRes.ok) return;
+        const payload = (await smartRes.json()) as { assets?: { items?: Array<{ id: string }> } };
+        for (const item of payload.assets?.items || []) {
+          if (!tagMap.has(item.id)) tagMap.set(item.id, new Set());
+          tagMap.get(item.id)!.add(prompt);
+          smartTagsMatched++;
+        }
+      } catch {
+        // Non-fatal if ML container is temporarily busy
       }
-    } catch {
-      // Non-fatal if ML container is temporarily busy
-    }
-  }
+    })
+  );
 
-  // 4. Cache thumbnails locally and upsert metadata into SQLite
+  // 4. Download thumbnails concurrently (preferring JPEG/PNG for CIELAB decoding) and upsert SQLite
   fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
   const db = getDb();
   const now = new Date().toISOString();
+
+  if (collected.length > 0) {
+    purgeDemoAssets();
+  }
+
+  const thumbFileById = new Map<string, string>();
+  const CONCURRENCY = 6;
+  for (let i = 0; i < collected.length; i += CONCURRENCY) {
+    const batch = collected.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      batch.map(async (item) => {
+        const safeId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const existingExts: Array<'jpg' | 'png' | 'webp'> = ['jpg', 'png', 'webp'];
+        for (const ext of existingExts) {
+          const candidate = `immich_${safeId}.${ext}`;
+          if (fs.existsSync(path.join(THUMBNAIL_DIR, candidate))) {
+            thumbFileById.set(item.id, candidate);
+            return;
+          }
+        }
+
+        try {
+          let thumbRes = await immichFetch(
+            `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
+            { headers: { Accept: 'image/jpeg,image/png,image/webp,*/*' } }
+          );
+          if (!thumbRes.ok) return;
+          let buf = Buffer.from(await thumbRes.arrayBuffer());
+
+          // If Immich returned WebP for thumbnail, try size=preview which Immich often serves as JPEG
+          if (isWebpBuffer(buf)) {
+            try {
+              const previewRes = await immichFetch(
+                `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=preview`,
+                { headers: { Accept: 'image/jpeg,image/png,*/*' } }
+              );
+              if (previewRes.ok) {
+                const previewBuf = Buffer.from(await previewRes.arrayBuffer());
+                if (!isWebpBuffer(previewBuf) && previewBuf.length > 0) {
+                  buf = previewBuf;
+                }
+              }
+            } catch {
+              // Keep original WebP buffer
+            }
+          }
+
+          if (buf.length > 0) {
+            const ext = detectThumbExt(buf);
+            const fileName = `immich_${safeId}.${ext}`;
+            fs.writeFileSync(path.join(THUMBNAIL_DIR, fileName), buf);
+            thumbFileById.set(item.id, fileName);
+          }
+        } catch {
+          // Non-fatal thumbnail error
+        }
+      })
+    );
+  }
 
   const upsert = db.prepare(`
     INSERT INTO assets (
@@ -387,52 +489,36 @@ export async function ingestFromLiveImmich(maxPages = 5): Promise<{
       is_archived = excluded.is_archived,
       is_trashed = excluded.is_trashed,
       is_already_albumed = excluded.is_already_albumed,
-      smart_tags_json = excluded.smart_tags_json
+      smart_tags_json = excluded.smart_tags_json,
+      thumbnail_file = COALESCE(excluded.thumbnail_file, assets.thumbnail_file)
   `);
 
-  for (const item of collected) {
-    const safeId = item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const thumbFile = `immich_${safeId}.jpg`;
-    const thumbFull = path.join(THUMBNAIL_DIR, thumbFile);
-
-    if (!fs.existsSync(thumbFull)) {
-      try {
-        const thumbRes = await immichFetch(
-          `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
-          { headers: { Accept: 'image/jpeg,image/webp,*/*' } }
-        );
-        if (thumbRes.ok) {
-          const buf = Buffer.from(await thumbRes.arrayBuffer());
-          fs.writeFileSync(thumbFull, buf);
-        }
-      } catch {
-        // Skip thumbnail fetch error; handled cleanly in pipeline
-      }
+  db.transaction(() => {
+    for (const item of collected) {
+      const exif = item.exifInfo || {};
+      upsert.run({
+        id: item.id,
+        file_name: item.originalFileName || `${item.id}.jpg`,
+        original_path: item.originalPath || `/immich/${item.originalFileName || item.id}`,
+        local_date_time: item.localDateTime || item.fileCreatedAt || now,
+        city: exif.city || null,
+        country: exif.country || null,
+        latitude: typeof exif.latitude === 'number' ? exif.latitude : null,
+        longitude: typeof exif.longitude === 'number' ? exif.longitude : null,
+        exif_make: exif.make || null,
+        exif_model: exif.model || null,
+        width: exif.exifImageWidth || 1600,
+        height: exif.exifImageHeight || 1200,
+        is_archived: item.isArchived ? 1 : 0,
+        is_trashed: item.isTrashed ? 1 : 0,
+        is_already_albumed: alreadyAlbumedIds.has(item.id) ? 1 : 0,
+        people_ids_json: JSON.stringify((item.people || []).map((p) => p.id)),
+        smart_tags_json: JSON.stringify(Array.from(tagMap.get(item.id) || [])),
+        thumbnail_file: thumbFileById.get(item.id) || null,
+        created_at: now,
+      });
     }
-
-    const exif = item.exifInfo || {};
-    upsert.run({
-      id: item.id,
-      file_name: item.originalFileName || `${item.id}.jpg`,
-      original_path: item.originalPath || `/immich/${item.originalFileName || item.id}`,
-      local_date_time: item.localDateTime || item.fileCreatedAt || now,
-      city: exif.city || null,
-      country: exif.country || null,
-      latitude: typeof exif.latitude === 'number' ? exif.latitude : null,
-      longitude: typeof exif.longitude === 'number' ? exif.longitude : null,
-      exif_make: exif.make || null,
-      exif_model: exif.model || null,
-      width: exif.exifImageWidth || 1600,
-      height: exif.exifImageHeight || 1200,
-      is_archived: item.isArchived ? 1 : 0,
-      is_trashed: item.isTrashed ? 1 : 0,
-      is_already_albumed: alreadyAlbumedIds.has(item.id) ? 1 : 0,
-      people_ids_json: JSON.stringify((item.people || []).map((p) => p.id)),
-      smart_tags_json: JSON.stringify(Array.from(tagMap.get(item.id) || [])),
-      thumbnail_file: fs.existsSync(thumbFull) ? thumbFile : null,
-      created_at: now,
-    });
-  }
+  })();
 
   return { ingested: collected.length, smartTagsMatched };
 }

@@ -5,9 +5,9 @@ import {
   EyeOff,
   ImagePlus,
   PlugZap,
-  RotateCcw,
   Save,
   Server,
+  Trash2,
   Unplug,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -43,7 +43,7 @@ interface LibraryIngestViewProps {
   }>;
   onDisconnectImmich: () => Promise<void>;
   onIngestImmich: () => Promise<void>;
-  onResetSample: () => Promise<void>;
+  onClearLocalCache: () => Promise<void>;
 }
 
 async function fileToThumbnail(file: File): Promise<{
@@ -83,7 +83,7 @@ export function LibraryIngestView({
   onTestImmichConfig,
   onDisconnectImmich,
   onIngestImmich,
-  onResetSample,
+  onClearLocalCache,
 }: LibraryIngestViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [filter, setFilter] = useState<'all' | 'eligible' | 'excluded'>('all');
@@ -194,7 +194,7 @@ export function LibraryIngestView({
                   ? `Connected (${immichStatus.serverVersion || 'live'})`
                   : immichStatus.configured
                     ? 'Unreachable'
-                    : 'Safe Demo Mode'}
+                    : 'Not Connected'}
               </span>
             </div>
 
@@ -206,7 +206,7 @@ export function LibraryIngestView({
                     ? 'Saved in app (AES-256 encrypted on server)'
                     : immichStatus.source === 'env'
                       ? 'Container environment variables'
-                      : 'None — local demo library active'}
+                      : 'Not configured'}
                 </span>
               </div>
               {immichStatus.maskedApiKey && (
@@ -363,15 +363,17 @@ export function LibraryIngestView({
               {busyAction === 'immich-ingest' ? 'Pulling...' : 'Pull & Scan from Immich'}
             </button>
 
-            <button
-              type="button"
-              disabled={busyAction !== null}
-              onClick={onResetSample}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Reset Demo
-            </button>
+            {assets.length > 0 && (
+              <button
+                type="button"
+                disabled={busyAction !== null}
+                onClick={onClearLocalCache}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-neutral-800 disabled:opacity-45 whitespace-nowrap shrink-0"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                {busyAction === 'clear-cache' ? 'Clearing...' : 'Clear Local Cache'}
+              </button>
+            )}
           </div>
         </section>
 
@@ -471,6 +473,20 @@ export function LibraryIngestView({
           </div>
         </div>
 
+        {filtered.length === 0 ? (
+          <div className="p-10 text-center">
+            <p className="text-sm font-medium text-neutral-900 dark:text-neutral-100">
+              {assets.length === 0
+                ? 'No cached assets yet'
+                : 'No assets match this filter'}
+            </p>
+            <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
+              {assets.length === 0
+                ? 'Save your Immich Server URL and API key above and click Pull & Scan from Immich, or drop local photos on the right.'
+                : 'Try switching between All, Eligible, and Excluded tabs.'}
+            </p>
+          </div>
+        ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
@@ -547,6 +563,7 @@ export function LibraryIngestView({
             </tbody>
           </table>
         </div>
+        )}
       </section>
     </div>
   );

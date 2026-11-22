@@ -17,6 +17,8 @@ LABEL org.opencontainers.image.description="Smart Event & CIELAB Color-Tone Albu
 LABEL org.opencontainers.image.source="https://github.com/NishantJh/immich_autoalbums"
 LABEL org.opencontainers.image.url="https://github.com/NishantJh/immich_autoalbums"
 LABEL org.opencontainers.image.licenses="MIT"
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.png"
+LABEL net.unraid.docker.webui="http://[IP]:[PORT:3000]"
 
 RUN apk add --no-cache python3 make g++
 COPY package.json ./

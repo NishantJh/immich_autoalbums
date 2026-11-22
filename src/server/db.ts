@@ -298,7 +298,7 @@ export function parseYamlToSettings(yamlText: string): Partial<OrganizerSettings
 
 export interface DbAssetRow {
   id: string;
-  source: 'sample' | 'upload' | 'immich';
+  source: 'upload' | 'immich';
   file_name: string;
   original_path: string;
   local_date_time: string;
@@ -496,4 +496,96 @@ export function getSyncHistory(): SyncHistoryRecord[] {
     mode: r.mode,
     syncedAt: r.synced_at,
   }));
+}
+
+const LEGACY_DEMO_THUMB_PREFIXES = [
+  'asset-home-anchor-',
+  'asset-goa-',
+  'asset-munnar-',
+  'asset-mumbai-',
+  'asset-filter-',
+];
+
+function safeUnlinkThumbnail(fileName: string | null | undefined): boolean {
+  if (!fileName) return false;
+  const safeBase = path.basename(fileName);
+  const resolved = path.resolve(THUMBNAIL_DIR, safeBase);
+  if (!resolved.startsWith(THUMBNAIL_DIR + path.sep)) return false;
+  if (!fs.existsSync(resolved)) return false;
+  try {
+    fs.unlinkSync(resolved);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes any legacy demo ('sample') rows and deletes their cached PNG thumbnails from disk.
+ * Ensures existing Unraid/Docker appdata directories are cleaned automatically on upgrade.
+ */
+export function purgeDemoAssets(): number {
+  const db = getDb();
+  const sampleRows = db
+    .prepare("SELECT id, thumbnail_file FROM assets WHERE source = 'sample'")
+    .all() as Array<{ id: string; thumbnail_file: string | null }>;
+
+  let removedFiles = 0;
+  for (const row of sampleRows) {
+    if (safeUnlinkThumbnail(row.thumbnail_file)) {
+      removedFiles++;
+    }
+  }
+
+  if (fs.existsSync(THUMBNAIL_DIR)) {
+    for (const entry of fs.readdirSync(THUMBNAIL_DIR)) {
+      if (LEGACY_DEMO_THUMB_PREFIXES.some((prefix) => entry.startsWith(prefix))) {
+        if (safeUnlinkThumbnail(entry)) {
+          removedFiles++;
+        }
+      }
+    }
+  }
+
+  if (sampleRows.length > 0) {
+    db.transaction(() => {
+      db.prepare("DELETE FROM assets WHERE source = 'sample'").run();
+      const remaining = db.prepare('SELECT COUNT(*) as c FROM assets').get() as { c: number };
+      if (remaining.c === 0) {
+        db.prepare('DELETE FROM clusters').run();
+        db.prepare("DELETE FROM sync_history WHERE mode = 'local_ledger'").run();
+        db.prepare("DELETE FROM sync_mappings WHERE immich_album_id LIKE 'immich-alb-%'").run();
+      }
+    })();
+  }
+
+  return sampleRows.length + removedFiles;
+}
+
+/**
+ * Clears all locally cached assets, clusters, and thumbnails without modifying Immich or saved credentials.
+ */
+export function clearLocalLibraryCache(): number {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT thumbnail_file FROM assets')
+    .all() as Array<{ thumbnail_file: string | null }>;
+
+  for (const row of rows) {
+    safeUnlinkThumbnail(row.thumbnail_file);
+  }
+
+  if (fs.existsSync(THUMBNAIL_DIR)) {
+    for (const entry of fs.readdirSync(THUMBNAIL_DIR)) {
+      safeUnlinkThumbnail(entry);
+    }
+  }
+
+  db.transaction(() => {
+    db.prepare('DELETE FROM assets').run();
+    db.prepare('DELETE FROM clusters').run();
+    db.prepare("DELETE FROM app_state WHERE key = 'pipeline_summary'").run();
+  })();
+
+  return rows.length;
 }

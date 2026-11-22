@@ -23,6 +23,7 @@ interface ReviewQueueViewProps {
   onSyncOne: (id: string) => Promise<void>;
   onMerge: (ids: string[], title?: string) => Promise<void>;
   onSplit: (id: string, splitIndex: number) => Promise<void>;
+  onOpenLibrary?: () => void;
 }
 
 type FilterTab = 'all' | 'pending' | 'trips' | 'local' | 'chapters' | 'synced' | 'discarded';
@@ -75,6 +76,7 @@ export function ReviewQueueView({
   onSyncOne,
   onMerge,
   onSplit,
+  onOpenLibrary,
 }: ReviewQueueViewProps) {
   const [filter, setFilter] = useState<FilterTab>('all');
   const [query, setQuery] = useState('');
@@ -240,11 +242,24 @@ export function ReviewQueueView({
       {filteredClusters.length === 0 ? (
         <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-[#131722] p-12 text-center">
           <p className="text-sm font-medium text-neutral-900 dark:text-neutral-100">
-            No album proposals match this filter
+            {clusters.length === 0
+              ? 'No album proposals yet'
+              : 'No album proposals match this filter'}
           </p>
           <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-            Try switching filter tabs, lowering the minimum photo threshold in Pipeline Lab, or uploading local photos.
+            {clusters.length === 0
+              ? 'Connect your Immich server or upload local photos in Library & Ingest, then click Run Scan.'
+              : 'Try switching filter tabs, lowering the minimum photo threshold in Pipeline Lab, or uploading local photos.'}
           </p>
+          {clusters.length === 0 && onOpenLibrary && (
+            <button
+              type="button"
+              onClick={onOpenLibrary}
+              className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 transition-colors"
+            >
+              Open Library &amp; Ingest
+            </button>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">

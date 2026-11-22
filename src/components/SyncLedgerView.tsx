@@ -1,4 +1,4 @@
-import { Layers, PlusCircle, UploadCloud } from 'lucide-react';
+import { Layers, UploadCloud } from 'lucide-react';
 import { useMemo } from 'react';
 import type { ClusterRecord, ImmichStatus, SyncHistoryRecord } from '../shared/types.ts';
 import { PaletteBar } from './PaletteBar.tsx';
@@ -8,7 +8,6 @@ interface SyncLedgerViewProps {
   syncHistory: SyncHistoryRecord[];
   immichStatus: ImmichStatus;
   busyAction: string | null;
-  onSimulateNewPhotos: () => Promise<void>;
   onSyncCluster: (id: string) => Promise<void>;
 }
 
@@ -17,7 +16,6 @@ export function SyncLedgerView({
   syncHistory,
   immichStatus,
   busyAction,
-  onSimulateNewPhotos,
   onSyncCluster,
 }: SyncLedgerViewProps) {
   // Alphabetically sorted active albums demonstrating Immich's flat-album list hierarchy
@@ -45,19 +43,18 @@ export function SyncLedgerView({
             </div>
           </div>
 
-          <button
-            type="button"
-            disabled={busyAction !== null}
-            onClick={onSimulateNewPhotos}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 dark:border-indigo-800 bg-indigo-50/70 dark:bg-indigo-950/40 px-3.5 py-2 text-xs font-medium text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-950/70 disabled:opacity-50 whitespace-nowrap shrink-0"
-          >
-            <PlusCircle className="h-3.5 w-3.5" />
-            {busyAction === 'simulate'
-              ? 'Adding 3 Goa photos...'
-              : 'Simulate +3 New Goa Photos'}
-          </button>
         </div>
 
+        {alphabeticalFlatList.length === 0 ? (
+          <div className="p-10 text-center">
+            <p className="text-sm font-medium text-neutral-900 dark:text-neutral-100">
+              No proposed albums yet
+            </p>
+            <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
+              Connect your Immich server in Library &amp; Ingest and run a scan to populate the flat-album hierarchy preview.
+            </p>
+          </div>
+        ) : (
         <div className="divide-y divide-neutral-100 dark:divide-neutral-800/80">
           {alphabeticalFlatList.map((cluster) => {
             const isSubChapter = cluster.clusterType === 'chapter';
@@ -128,6 +125,7 @@ export function SyncLedgerView({
             );
           })}
         </div>
+        )}
       </section>
 
       {/* Idempotent Sync Ledger Table */}
@@ -141,7 +139,7 @@ export function SyncLedgerView({
               Target mode:{' '}
               {immichStatus.configured && immichStatus.reachable
                 ? `Live Immich (${immichStatus.hostLabel})`
-                : 'Local SQLite Ledger (configure IMMICH_URL & IMMICH_API_KEY for live writes)'}
+                : 'Local SQLite Ledger (connect Immich in Library & Ingest for live writes)'}
             </p>
           </div>
           <span className="text-xs font-mono tabular-nums text-neutral-500 dark:text-neutral-400">
@@ -155,7 +153,7 @@ export function SyncLedgerView({
               No albums synced yet
             </p>
             <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              Click Create via POST above or Sync to Immich in the Review Queue. Then click Simulate +3 New Goa Photos to test idempotent PUT appending.
+              Approve and sync clusters from the Review Queue or click Create via POST above to write albums idempotently.
             </p>
           </div>
         ) : (

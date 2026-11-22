@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Maintainer>
-  <Icon>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/NishantJh/immich_autoalbums/main/public/icon.png</Icon>
   <Profile>
     Self-hosted media automation and Immich companion tools maintained by NishantJh. Focused on privacy-first local photo analysis, perceptual CIELAB color-tone scene splitting, and reliable Docker deployments for Unraid home servers.
   </Profile>

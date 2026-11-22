@@ -305,26 +305,30 @@ export function runFullPipeline(): {
       if (row.thumbnailFile) {
         const resolved = path.resolve(THUMBNAIL_DIR, path.basename(row.thumbnailFile));
         if (resolved.startsWith(THUMBNAIL_DIR + path.sep) && fs.existsSync(resolved)) {
-          const buf = fs.readFileSync(resolved);
-          const decoded = decodeImageBufferToRgba(buf);
-          const extracted = extractColorFeaturesFromPixels(
-            decoded.data,
-            decoded.width,
-            decoded.height
-          );
-          histogram = extracted.histogram;
-          avgLab = extracted.avgLab;
-          palette = extracted.palette;
-          updateLabStmt.run(
-            avgLab.l,
-            avgLab.a,
-            avgLab.b,
-            avgLab.chroma,
-            JSON.stringify(histogram),
-            JSON.stringify(palette),
-            a.id
-          );
-          newlyExtracted++;
+          try {
+            const buf = fs.readFileSync(resolved);
+            const decoded = decodeImageBufferToRgba(buf);
+            const extracted = extractColorFeaturesFromPixels(
+              decoded.data,
+              decoded.width,
+              decoded.height
+            );
+            histogram = extracted.histogram;
+            avgLab = extracted.avgLab;
+            palette = extracted.palette;
+            updateLabStmt.run(
+              avgLab.l,
+              avgLab.a,
+              avgLab.b,
+              avgLab.chroma,
+              JSON.stringify(histogram),
+              JSON.stringify(palette),
+              a.id
+            );
+            newlyExtracted++;
+          } catch {
+            // Unsupported or corrupt thumbnail buffer falls back cleanly below
+          }
         }
       }
     }
@@ -390,10 +394,10 @@ export function runFullPipeline(): {
     geohashBuckets.set(gh, bucket);
   }
 
-  let homeGeohash = 'te7ud';
-  let homeLat = 19.076;
-  let homeLng = 72.8777;
-  let homeCity = 'Home Base';
+  let homeGeohash = '—';
+  let homeLat = 0;
+  let homeLng = 0;
+  let homeCity = '—';
   let homeCount = 0;
 
   for (const [gh, b] of geohashBuckets.entries()) {

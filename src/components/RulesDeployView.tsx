@@ -149,9 +149,25 @@ export function RulesDeployView({
 
   const handleCopy = async () => {
     if (!currentBundleContent) return;
-    await navigator.clipboard.writeText(currentBundleContent);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(currentBundleContent);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = currentBundleContent;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setCopied(false);
+    }
   };
 
   const handleDownload = () => {

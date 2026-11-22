@@ -30,7 +30,7 @@ export type AestheticMood =
 
 export interface AssetRecord {
   id: string;
-  source: 'sample' | 'upload' | 'immich';
+  source: 'upload' | 'immich';
   fileName: string;
   originalPath: string;
   localDateTime: string;

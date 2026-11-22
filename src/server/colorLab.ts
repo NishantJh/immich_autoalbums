@@ -97,6 +97,17 @@ export function decodeImageBufferToRgba(
     };
   }
 
+  const isJpeg =
+    (buffer.length >= 3 &&
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8 &&
+      buffer[2] === 0xff) ||
+    mimeHint === 'image/jpeg';
+
+  if (!isJpeg) {
+    throw new Error('Unsupported thumbnail encoding (expected JPEG or PNG)');
+  }
+
   const decoded = jpeg.decode(buffer, { useTArray: true, formatAsRGBA: true });
   return {
     data: decoded.data,
