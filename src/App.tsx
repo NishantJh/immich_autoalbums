@@ -742,16 +742,40 @@ export default function App() {
     id: WorkspaceSection;
     label: string;
     icon: typeof FolderKanban;
-    metric?: number;
+    metric?: string;
+    highlight?: boolean;
   }> = [
-    { id: 'review', label: 'Review Queue', icon: FolderKanban, metric: activeClusterCount },
+    {
+      id: 'review',
+      label: 'Review Queue',
+      icon: FolderKanban,
+      metric: activeClusterCount.toLocaleString(),
+    },
     {
       id: 'pipeline',
       label: 'Pipeline Lab',
       icon: GitBranch,
-      metric: pipelineSummary?.stage3.sceneSplitsDetected,
+      metric: pullProgress?.active
+        ? `${pullProgress.percent}%`
+        : pipelineSummary
+          ? (
+              pipelineSummary.stage3.eventsEvaluated ||
+              pipelineSummary.stage3.sceneSplitsDetected
+            ).toLocaleString()
+          : undefined,
+      highlight: Boolean(pullProgress?.active),
     },
-    { id: 'sync', label: 'Sync Ledger', icon: History, metric: syncedCount },
+    {
+      id: 'sync',
+      label: 'Sync Ledger',
+      icon: History,
+      metric:
+        activeClusterCount > 0
+          ? `${syncedCount}/${activeClusterCount}`
+          : syncHistory.length > 0
+            ? syncHistory.length.toLocaleString()
+            : '0',
+    },
     {
       id: 'library',
       label: 'Library & Ingest',
@@ -760,7 +784,7 @@ export default function App() {
         totalAssetCount,
         pipelineSummary?.stage1.totalAssets ?? 0,
         pullProgress?.active ? (pullProgress.dbAssetCount ?? 0) : 0
-      ),
+      ).toLocaleString(),
     },
     { id: 'rules', label: 'Rules & Config', icon: Sliders },
   ];
@@ -809,10 +833,14 @@ export default function App() {
                   />
                   <span>{item.label}</span>
                 </span>
-                {typeof item.metric === 'number' && (
+                {item.metric !== undefined && (
                   <span
                     className={`font-mono text-xs tabular-nums ${
-                      active ? 'text-indigo-700 dark:text-indigo-300' : 'text-zinc-400 dark:text-zinc-500'
+                      item.highlight
+                        ? 'font-semibold text-indigo-600 dark:text-indigo-400'
+                        : active
+                          ? 'text-indigo-700 dark:text-indigo-300'
+                          : 'text-zinc-400 dark:text-zinc-500'
                     }`}
                   >
                     {item.metric}
@@ -905,8 +933,14 @@ export default function App() {
                       <Icon className="h-4 w-4 shrink-0" />
                       <span>{item.label}</span>
                     </span>
-                    {typeof item.metric === 'number' && (
-                      <span className="font-mono text-xs tabular-nums opacity-70">
+                    {item.metric !== undefined && (
+                      <span
+                        className={`font-mono text-xs tabular-nums ${
+                          item.highlight
+                            ? 'font-semibold text-indigo-600 dark:text-indigo-400'
+                            : 'opacity-70'
+                        }`}
+                      >
                         {item.metric}
                       </span>
                     )}
@@ -1071,15 +1105,42 @@ export default function App() {
               </button>
 
               <div className="px-5 py-4">
-                <div className="text-xs text-zinc-500 dark:text-zinc-400">CIELAB Scene Splits</div>
-                <div className="mt-1.5 flex items-baseline gap-2">
-                  <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
-                    {pipelineSummary.stage3.sceneSplitsDetected}
-                  </span>
-                  <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
-                    {pipelineSummary.stage3.totalChaptersCreated} chapters
-                  </span>
-                </div>
+                {pullProgress?.active &&
+                (pullProgress.phase === 'thumbnails' || pullProgress.phase === 'clustering') ? (
+                  <>
+                    <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                      {pullProgress.phase === 'clustering'
+                        ? 'CIELAB Clustering (Live)'
+                        : 'CIELAB Color Extraction (Live)'}
+                    </div>
+                    <div className="mt-1.5 flex items-baseline gap-2">
+                      <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-indigo-600 dark:text-indigo-400">
+                        {pullProgress.phase === 'clustering'
+                          ? `${pullProgress.percent}%`
+                          : pullProgress.current.toLocaleString()}
+                      </span>
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
+                        {pullProgress.phase === 'clustering'
+                          ? 'building albums'
+                          : `/ ${pullProgress.total.toLocaleString()} photos`}
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                      CIELAB Scene Splits
+                    </div>
+                    <div className="mt-1.5 flex items-baseline gap-2">
+                      <span className="text-2xl font-semibold font-mono tabular-nums tracking-tight text-zinc-900 dark:text-zinc-100">
+                        {pipelineSummary.stage3.sceneSplitsDetected}
+                      </span>
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
+                        {pipelineSummary.stage3.totalChaptersCreated} chapters
+                      </span>
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="px-5 py-4">

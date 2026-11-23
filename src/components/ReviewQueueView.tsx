@@ -155,7 +155,8 @@ export function ReviewQueueView({
         c.title.toLowerCase().includes(q) ||
         c.locationLabel.toLowerCase().includes(q) ||
         c.moodLabel.toLowerCase().includes(q) ||
-        (c.occasionLabel || '').toLowerCase().includes(q)
+        (c.occasionLabel || '').toLowerCase().includes(q) ||
+        (c.signalBreakdown?.namedPeople || []).some((p) => p.toLowerCase().includes(q))
       );
     });
   }, [clusters, filter, query]);
@@ -412,7 +413,7 @@ export function ReviewQueueView({
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search title, city, or mood..."
+              placeholder="Search title, city, person, or mood..."
               className="w-full rounded-lg border border-zinc-200/90 dark:border-white/[0.08] bg-white dark:bg-[#11141B] pl-9 pr-8 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-colors"
             />
             {query && (
@@ -901,13 +902,24 @@ export function ReviewQueueView({
                     )}
                   </div>
 
-                  {/* Location, Date Range, EMD Metadata */}
+                  {/* Location, Date Range, People, EMD Metadata */}
                   <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-500 dark:text-zinc-400">
                     <span>{cluster.locationLabel}</span>
                     <span aria-hidden="true">·</span>
                     <span className="tabular-nums">
                       {formatDateSpan(cluster.startDate, cluster.endDate)}
                     </span>
+                    {cluster.signalBreakdown && cluster.signalBreakdown.namedPeople.length > 0 && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-zinc-600 dark:text-zinc-300">
+                          with {cluster.signalBreakdown.namedPeople.slice(0, 3).join(', ')}
+                          {cluster.signalBreakdown.namedPeople.length > 3
+                            ? ` +${cluster.signalBreakdown.namedPeople.length - 3}`
+                            : ''}
+                        </span>
+                      </>
+                    )}
                     {cluster.emdBoundaryScore > 0 && (
                       <>
                         <span aria-hidden="true">·</span>

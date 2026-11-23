@@ -40,6 +40,7 @@ import {
   checkImmichStatus,
   createLiveImmichAlbum,
 } from './immichClient.ts';
+import { logInfo } from './logger.ts';
 
 interface EnrichedAsset {
   asset: AssetRecord;
@@ -797,15 +798,93 @@ export function runFullPipeline(): {
   const rawEvents: RawEvent[] = [];
   let unclusteredNoiseCount = 0;
   let bridgedNoGpsCount = 0;
+  let peopleConsolidatedTrips = 0;
 
-  // 2A. Multi-Signal Macro Trip Clustering (GPS + Time + State/Country + Immich ML + People + CIELAB Chroma)
+  // Identify household faces BEFORE trip clustering using Home-Base photos so we can
+  // distinguish everyday household members from travel companions / guests on trips.
+  const homeGeoTimestamps = homeGeoAssets
+    .map((a) => a.timestampMs)
+    .sort((a, b) => a - b);
+
+  const countHomePhotosBetween = (startMs: number, endMs: number): number => {
+    if (homeGeoTimestamps.length === 0 || endMs <= startMs) return 0;
+    // Lower bound > startMs
+    let lo = 0;
+    let hi = homeGeoTimestamps.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (homeGeoTimestamps[mid] <= startMs) lo = mid + 1;
+      else hi = mid;
+    }
+    const leftIdx = lo;
+    // Upper bound < endMs
+    lo = leftIdx;
+    hi = homeGeoTimestamps.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (homeGeoTimestamps[mid] < endMs) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.max(0, lo - leftIdx);
+  };
+
+  const baselineHomePool = homeGeoAssets.length >= 6 ? homeGeoAssets : eligible;
+  const baselineDays = new Set(baselineHomePool.map((a) => a.asset.localDateTime.slice(0, 10)));
+  const personDayMap = new Map<string, Set<string>>();
+  for (const a of baselineHomePool) {
+    const day = a.asset.localDateTime.slice(0, 10);
+    for (const pid of a.asset.peopleIds) {
+      if (!personDayMap.has(pid)) personDayMap.set(pid, new Set());
+      personDayMap.get(pid)!.add(day);
+    }
+  }
+  const householdPeople = new Set<string>();
+  const dayThreshold = Math.max(2, Math.ceil(baselineDays.size * 0.4));
+  for (const [pid, days] of personDayMap.entries()) {
+    if (days.size >= dayThreshold) {
+      householdPeople.add(pid);
+    }
+  }
+
+  const getNonHouseholdPeople = (ids: Iterable<string>): Set<string> => {
+    const out = new Set<string>();
+    for (const pid of ids) {
+      if (!householdPeople.has(pid)) out.add(pid);
+    }
+    return out;
+  };
+
+  const countSetOverlap = (a: Set<string>, b: Set<string>): number => {
+    let n = 0;
+    for (const v of a) {
+      if (b.has(v)) n++;
+    }
+    return n;
+  };
+
+  // 2A. Multi-Signal Macro Trip Clustering (GPS + Dates + People Cohorts + Home-Return Check + ML + Chroma)
   const tripGapMs = settings.tripGapHours * 3600 * 1000;
+  const extendedPeopleGapMs = Math.max(tripGapMs * 2.5, 96 * 3600 * 1000); // up to 4 days across quiet rest days when still away
   const rawTripBuckets: EnrichedAsset[][] = [];
   let currentTrip: EnrichedAsset[] = [];
+  let currentTripPeople = new Set<string>();
+  let currentTripCompanions = new Set<string>();
 
-  const canContinueTrip = (prev: EnrichedAsset, next: EnrichedAsset): boolean => {
+  const canContinueTrip = (
+    prev: EnrichedAsset,
+    next: EnrichedAsset,
+    tripPeople: Set<string>,
+    tripCompanions: Set<string>
+  ): boolean => {
     const gap = next.timestampMs - prev.timestampMs;
-    if (gap > tripGapMs) return false;
+    if (gap > extendedPeopleGapMs) return false;
+
+    const returnedHomeBetween =
+      hasActiveHomeBase &&
+      effectiveHomeMode !== 'disabled' &&
+      countHomePhotosBetween(prev.timestampMs, next.timestampMs) >= 2;
+
+    if (returnedHomeBetween) return false;
 
     const distKm =
       isValidGps(prev.asset.latitude, prev.asset.longitude) &&
@@ -818,23 +897,77 @@ export function runFullPipeline(): {
           )
         : null;
 
-    // Hard spatial separation for long-haul jumps (> 320 km)
+    const nextPeople = new Set(next.asset.peopleIds);
+    const nextCompanions = getNonHouseholdPeople(nextPeople);
+    const sharedCompanions = countSetOverlap(tripCompanions, nextCompanions);
+    const sharedAllPeople = countSetOverlap(tripPeople, nextPeople);
+    const peopleCohortSim =
+      tripPeople.size > 0 && nextPeople.size > 0
+        ? jaccardSimilarity(tripPeople, nextPeople)
+        : 0;
+
+    // Different social travel groups on back-to-back trips should NOT merge across a big jump
+    const disjointCompanionGroups =
+      tripCompanions.size >= 2 &&
+      nextCompanions.size >= 2 &&
+      sharedCompanions === 0 &&
+      gap > 18 * 3600 * 1000 &&
+      distKm !== null &&
+      distKm > 100;
+    if (disjointCompanionGroups) return false;
+
+    const sameCity = Boolean(
+      prev.asset.city &&
+        next.asset.city &&
+        prev.asset.city.toLowerCase() === next.asset.city.toLowerCase()
+    );
+    const sameState = Boolean(
+      prev.asset.state &&
+        next.asset.state &&
+        prev.asset.state.toLowerCase() === next.asset.state.toLowerCase()
+    );
+    const sameCountry = Boolean(
+      prev.asset.country &&
+        next.asset.country &&
+        prev.asset.country.toLowerCase() === next.asset.country.toLowerCase()
+    );
+
+    // Extended quiet-day gap (> tripGapHours, up to 4 days) without returning home:
+    // keep the trip together if same destination OR traveling with the same people cohort!
+    if (gap > tripGapMs) {
+      if (sameCity || (distKm !== null && distKm <= 80)) {
+        return true;
+      }
+      if (
+        (sharedCompanions >= 1 || (sharedAllPeople >= 2 && peopleCohortSim >= 0.4)) &&
+        ((distKm !== null && distKm <= 500) || sameState || sameCountry)
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    // Within standard tripGapHours:
+    // People-backed multi-city transit (up to 550 km or same country with same travel companions)
+    if (
+      (sharedCompanions >= 1 || (sharedAllPeople >= 2 && peopleCohortSim >= 0.45)) &&
+      ((distKm !== null && distKm <= 550) || sameCountry)
+    ) {
+      return true;
+    }
+
+    // Hard spatial separation for long-haul jumps (> 320 km) without shared travel companions
     if (distKm !== null && distKm > 320) return false;
     // Direct regional continuity (< 120 km)
     if (distKm !== null && distKm <= 120) return true;
     // Same city continuity
-    if (prev.asset.city && next.asset.city && prev.asset.city === next.asset.city) return true;
+    if (sameCity) return true;
 
     // Road-trip / multi-stop bridge (120–260 km) reinforced by same State + ML tags + Faces + Chroma
-    const sameState =
-      Boolean(prev.asset.state && next.asset.state && prev.asset.state === next.asset.state);
-    const sameCountry =
-      Boolean(prev.asset.country && next.asset.country && prev.asset.country === next.asset.country);
     if (sameState || (sameCountry && distKm !== null && distKm <= 200)) {
       const mlOverlap = jaccardSimilarity(prev.asset.smartTags, next.asset.smartTags);
-      const peopleOverlap = jaccardSimilarity(prev.asset.peopleIds, next.asset.peopleIds);
       const chromaSim = 1 - computeLabHistogramEmd(prev.histogram, next.histogram);
-      if (peopleOverlap > 0 || mlOverlap >= 0.35 || (sameState && chromaSim >= 0.72)) {
+      if (sharedAllPeople > 0 || mlOverlap >= 0.35 || (sameState && chromaSim >= 0.72)) {
         return true;
       }
     }
@@ -845,33 +978,151 @@ export function runFullPipeline(): {
   for (const item of awayAssets) {
     if (currentTrip.length === 0) {
       currentTrip.push(item);
+      for (const pid of item.asset.peopleIds) {
+        currentTripPeople.add(pid);
+        if (!householdPeople.has(pid)) currentTripCompanions.add(pid);
+      }
       continue;
     }
     const prev = currentTrip[currentTrip.length - 1];
-    if (canContinueTrip(prev, item)) {
+    if (canContinueTrip(prev, item, currentTripPeople, currentTripCompanions)) {
       currentTrip.push(item);
+      for (const pid of item.asset.peopleIds) {
+        currentTripPeople.add(pid);
+        if (!householdPeople.has(pid)) currentTripCompanions.add(pid);
+      }
     } else {
       rawTripBuckets.push(currentTrip);
       currentTrip = [item];
+      currentTripPeople = new Set(item.asset.peopleIds);
+      currentTripCompanions = getNonHouseholdPeople(item.asset.peopleIds);
     }
   }
   if (currentTrip.length > 0) {
     rawTripBuckets.push(currentTrip);
   }
 
-  // 2A+. DSLR / No-GPS Photo Bridging:
-  // Bridge non-geotagged photos shot during a Trip window (within 4h) when Chroma/ML/Faces/Camera align
+  // 2A-Pass 2: Consolidate consecutive trip segments using Trip-Wide People Cohorts + Dates + Home-Return Check.
+  // Fixes trips fragmented when individual boundary photos were landscapes (no faces) or had a quiet rest day.
+  const summarizeTripBucket = (bucket: EnrichedAsset[]) => {
+    const people = new Set<string>();
+    const companions = new Set<string>();
+    const cities = new Set<string>();
+    const states = new Set<string>();
+    const countries = new Set<string>();
+    for (const item of bucket) {
+      for (const pid of item.asset.peopleIds) {
+        people.add(pid);
+        if (!householdPeople.has(pid)) companions.add(pid);
+      }
+      const cTrim = item.asset.country?.trim() || null;
+      const cleanC = sanitizePlaceName(item.asset.city, cTrim);
+      const cleanS = sanitizePlaceName(item.asset.state, cTrim);
+      if (cleanC && (!cTrim || cleanC.toLowerCase() !== cTrim.toLowerCase())) {
+        cities.add(cleanC.toLowerCase());
+      }
+      if (cleanS && (!cTrim || cleanS.toLowerCase() !== cTrim.toLowerCase())) {
+        states.add(cleanS.toLowerCase());
+      }
+      if (cTrim) countries.add(cTrim.toLowerCase());
+    }
+    return {
+      startMs: bucket[0].timestampMs,
+      endMs: bucket[bucket.length - 1].timestampMs,
+      centroid: computeGpsCentroid(bucket),
+      people,
+      companions,
+      cities,
+      states,
+      countries,
+    };
+  };
+
+  const consolidatedTripBuckets: EnrichedAsset[][] = [];
+  for (const bucket of rawTripBuckets) {
+    if (consolidatedTripBuckets.length === 0) {
+      consolidatedTripBuckets.push(bucket);
+      continue;
+    }
+    const prevBucket = consolidatedTripBuckets[consolidatedTripBuckets.length - 1];
+    const prevMeta = summarizeTripBucket(prevBucket);
+    const nextMeta = summarizeTripBucket(bucket);
+    const gapMs = nextMeta.startMs - prevMeta.endMs;
+
+    const returnedHome =
+      hasActiveHomeBase &&
+      effectiveHomeMode !== 'disabled' &&
+      countHomePhotosBetween(prevMeta.endMs, nextMeta.startMs) >= 2;
+
+    const distKm =
+      prevMeta.centroid && nextMeta.centroid
+        ? haversineKm(
+            prevMeta.centroid.lat,
+            prevMeta.centroid.lng,
+            nextMeta.centroid.lat,
+            nextMeta.centroid.lng
+          )
+        : null;
+
+    const sharedCompanions = countSetOverlap(prevMeta.companions, nextMeta.companions);
+    const sharedAllPeople = countSetOverlap(prevMeta.people, nextMeta.people);
+    const cohortJaccard =
+      prevMeta.people.size > 0 && nextMeta.people.size > 0
+        ? jaccardSimilarity(prevMeta.people, nextMeta.people)
+        : 0;
+    const sharedCity = countSetOverlap(prevMeta.cities, nextMeta.cities) > 0;
+    const sharedState = countSetOverlap(prevMeta.states, nextMeta.states) > 0;
+    const sharedCountry = countSetOverlap(prevMeta.countries, nextMeta.countries) > 0;
+
+    // Respect distinct companion groups (e.g. work colleagues Mon-Wed vs family Thu-Sun)
+    const disjointGroups =
+      prevMeta.companions.size >= 2 &&
+      nextMeta.companions.size >= 2 &&
+      sharedCompanions === 0 &&
+      (distKm === null || distKm > 60);
+
+    const shouldConsolidate =
+      !returnedHome &&
+      !disjointGroups &&
+      gapMs >= 0 &&
+      gapMs <= extendedPeopleGapMs &&
+      (
+        // 1. People + Dates: same travel companions or strong multi-person cohort on the same multi-stop trip
+        ((sharedCompanions >= 1 || (sharedAllPeople >= 2 && cohortJaccard >= 0.4)) &&
+          ((distKm !== null && distKm <= 650) || sharedState || sharedCountry)) ||
+        // 2. Same city / nearby destination across a quiet day without returning home
+        ((sharedCity || (distKm !== null && distKm <= 60)) &&
+          gapMs <= Math.max(tripGapMs * 2.5, 96 * 3600 * 1000))
+      );
+
+    if (shouldConsolidate) {
+      prevBucket.push(...bucket);
+      prevBucket.sort((x, y) => x.timestampMs - y.timestampMs);
+      peopleConsolidatedTrips++;
+    } else {
+      consolidatedTripBuckets.push(bucket);
+    }
+  }
+
+  // 2A+. DSLR / WhatsApp / No-GPS Photo Bridging using Dates + Trip-Wide People Cohort + Chroma + ML:
+  // Bridge non-geotagged photos shot during a Trip window when recognized people match the trip cohort,
+  // or within 6h when visual Chroma/ML/Camera align.
+  const tripMetaCache = consolidatedTripBuckets.map((trip) => summarizeTripBucket(trip));
   const remainingNoGps: EnrichedAsset[] = [];
-  const bridgeWindowMs = 4 * 3600 * 1000;
+  const bridgeWindowMs = 6 * 3600 * 1000;
 
   for (const item of noGpsAssets) {
-    let matchedTrip: EnrichedAsset[] | null = null;
+    let matchedTripIdx = -1;
     let bestScore = 0;
+    const itemPeople = new Set(item.asset.peopleIds);
+    const itemCompanions = getNonHouseholdPeople(itemPeople);
 
-    for (const trip of rawTripBuckets) {
+    for (let tIdx = 0; tIdx < consolidatedTripBuckets.length; tIdx++) {
+      const trip = consolidatedTripBuckets[tIdx];
       if (trip.length === 0) continue;
-      const tStart = trip[0].timestampMs - bridgeWindowMs;
-      const tEnd = trip[trip.length - 1].timestampMs + bridgeWindowMs;
+      const meta = tripMetaCache[tIdx];
+      const tStart = meta.startMs - bridgeWindowMs;
+      const tEnd = meta.endMs + bridgeWindowMs;
       if (item.timestampMs < tStart || item.timestampMs > tEnd) continue;
 
       // Find chronologically nearest photo in this trip
@@ -884,34 +1135,66 @@ export function runFullPipeline(): {
           nearest = candidate;
         }
       }
+
+      const sharedTripCompanions = countSetOverlap(itemCompanions, meta.companions);
+      const sharedTripPeople = countSetOverlap(itemPeople, meta.people);
+      const insideDateSpan = item.timestampMs >= meta.startMs && item.timestampMs <= meta.endMs;
+
+      // Strong People + Date match: shared travel companion during the trip's date range
+      if (sharedTripCompanions >= 1 && (insideDateSpan || minDt <= 12 * 3600 * 1000)) {
+        const score = 0.85 + Math.min(0.14, sharedTripCompanions * 0.05);
+        if (score > bestScore) {
+          bestScore = score;
+          matchedTripIdx = tIdx;
+        }
+        continue;
+      }
+
+      // Recognized trip person (including household member) inside the trip date span & within 12h
+      if (sharedTripPeople >= 1 && insideDateSpan && minDt <= 12 * 3600 * 1000) {
+        const score = 0.72 + Math.max(0, 1 - minDt / (12 * 3600 * 1000)) * 0.15;
+        if (score > bestScore) {
+          bestScore = score;
+          matchedTripIdx = tIdx;
+        }
+        continue;
+      }
+
       if (minDt > bridgeWindowMs) continue;
 
       const timeAffinity = Math.max(0, 1 - minDt / bridgeWindowMs);
       const chromaAffinity = 1 - computeLabHistogramEmd(item.histogram, nearest.histogram);
       const mlAffinity = jaccardSimilarity(item.asset.smartTags, nearest.asset.smartTags);
-      const peopleAffinity = jaccardSimilarity(item.asset.peopleIds, nearest.asset.peopleIds);
+      const peopleAffinity =
+        itemPeople.size > 0 && meta.people.size > 0
+          ? jaccardSimilarity(itemPeople, meta.people)
+          : 0;
       const score =
-        timeAffinity * 0.45 +
-        chromaAffinity * 0.30 +
-        mlAffinity * 0.15 +
-        peopleAffinity * 0.10;
+        timeAffinity * 0.42 +
+        chromaAffinity * 0.28 +
+        mlAffinity * 0.14 +
+        peopleAffinity * 0.16;
 
       if (score >= 0.48 && score > bestScore) {
         bestScore = score;
-        matchedTrip = trip;
+        matchedTripIdx = tIdx;
       }
     }
 
-    if (matchedTrip) {
-      matchedTrip.push(item);
+    if (matchedTripIdx >= 0) {
+      consolidatedTripBuckets[matchedTripIdx].push(item);
+      for (const pid of item.asset.peopleIds) {
+        tripMetaCache[matchedTripIdx].people.add(pid);
+        if (!householdPeople.has(pid)) tripMetaCache[matchedTripIdx].companions.add(pid);
+      }
       bridgedNoGpsCount++;
     } else {
       remainingNoGps.push(item);
     }
   }
 
-  // Finalize Macro Trips (strict place specificity: City -> State -> Country -> GPS)
-  for (const bucket of rawTripBuckets) {
+  // Finalize Macro Trips (strict place specificity: City -> Multi-Stop Cities -> State -> Country -> GPS)
+  for (const bucket of consolidatedTripBuckets) {
     bucket.sort((x, y) => x.timestampMs - y.timestampMs);
     if (bucket.length >= settings.minPhotosPerAlbum) {
       const cityCounts = new Map<string, number>();
@@ -943,13 +1226,26 @@ export function runFullPipeline(): {
         centroid?.lng || 0,
         stateCounts
       );
+
+      // If a consolidated multi-stop trip spent >= 25% of tagged photos in a second major city, reflect both
+      const rankedCities = Array.from(cityCounts.entries()).sort((x, y) => y[1] - x[1]);
+      const totalCityTagged = rankedCities.reduce((s, [, c]) => s + c, 0);
+      const tripPlaceTitle =
+        rankedCities.length >= 2 &&
+        totalCityTagged >= 8 &&
+        rankedCities[1][1] / totalCityTagged >= 0.25 &&
+        rankedCities[0][0].toLowerCase() !== rankedCities[1][0].toLowerCase()
+          ? `${rankedCities[0][0]} & ${rankedCities[1][0]}`
+          : topCity;
+
       const locationLabel = country && country !== topCity ? `${topCity}, ${country}` : topCity;
       rawEvents.push({
         id: `evt-trip-${topCity.toLowerCase().replace(/[^a-z0-9]/g, '')}-${formatYearMonth(bucket[0].asset.localDateTime)}-${rawEvents.length + 1}`,
         type: 'trip',
         assets: bucket,
         locationLabel,
-        eventName: effectiveHomeMode === 'disabled' ? `${topCity}` : `${topCity} Trip`,
+        eventName:
+          effectiveHomeMode === 'disabled' ? `${tripPlaceTitle}` : `${tripPlaceTitle} Trip`,
       });
     } else {
       unclusteredNoiseCount += bucket.length;
@@ -961,38 +1257,20 @@ export function runFullPipeline(): {
     (x, y) => x.timestampMs - y.timestampMs
   );
 
-  // Identify household faces: people appearing across >40% of distinct home days
-  const homeDays = new Set(homeAssets.map((a) => a.asset.localDateTime.slice(0, 10)));
-  const personDayMap = new Map<string, Set<string>>();
-  for (const a of homeAssets) {
-    const day = a.asset.localDateTime.slice(0, 10);
-    for (const pid of a.asset.peopleIds) {
-      if (!personDayMap.has(pid)) personDayMap.set(pid, new Set());
-      personDayMap.get(pid)!.add(day);
-    }
-  }
-  const householdPeople = new Set<string>();
-  const dayThreshold = Math.max(2, Math.ceil(homeDays.size * 0.4));
-  for (const [pid, days] of personDayMap.entries()) {
-    if (days.size >= dayThreshold) {
-      householdPeople.add(pid);
-    }
-  }
-
   // 2B. Multi-Signal Local Event Discovery (Chronological Window + GPS + Immich ML + CIELAB Chroma + Faces + EXIF)
   const localGapMs = settings.localEventGapHours * 3600 * 1000;
+  const companionMultiDayGapMs = Math.max(localGapMs, 36 * 3600 * 1000);
   const fineRadiusKm = settings.localEventRadiusMeters / 1000;
   const visited = new Set<number>();
   const minClusterPts = Math.max(3, settings.minPhotosPerAlbum);
 
   const areLocalNeighbors = (a: EnrichedAsset, b: EnrichedAsset): boolean => {
     const dt = Math.abs(a.timestampMs - b.timestampMs);
-    if (dt > localGapMs) return false;
+    if (dt > companionMultiDayGapMs) return false;
 
     const aGuests = a.asset.peopleIds.filter((p) => !householdPeople.has(p));
     const bGuests = b.asset.peopleIds.filter((p) => !householdPeople.has(p));
     const sharesGuest = aGuests.some((g) => bGuests.includes(g));
-    if (sharesGuest) return true;
 
     const bothHaveGps =
       isValidGps(a.asset.latitude, a.asset.longitude) &&
@@ -1006,6 +1284,19 @@ export function runFullPipeline(): {
         b.asset.latitude!,
         b.asset.longitude!
       );
+    }
+
+    // Shared non-household companions across consecutive days (e.g. DSLR weekend getaway with friends)
+    if (sharesGuest) {
+      if (dt <= localGapMs) return true;
+      if ((!bothHaveGps || (distKm !== null && distKm <= 30)) && dt <= companionMultiDayGapMs) {
+        return true;
+      }
+    }
+
+    if (dt > localGapMs) return false;
+
+    if (distKm !== null) {
       // Fast-path: same exact venue burst within 2 hours
       if (distKm <= fineRadiusKm * 1.6 && dt <= Math.min(localGapMs, 2 * 3600 * 1000)) {
         return true;
@@ -1086,17 +1377,17 @@ export function runFullPipeline(): {
       component.push(curr);
       const currTs = homeAssets[curr].timestampMs;
 
-      // Scan backward within localGapMs
+      // Scan backward within companionMultiDayGapMs
       for (let j = curr - 1; j >= 0; j--) {
-        if (currTs - homeAssets[j].timestampMs > localGapMs) break;
+        if (currTs - homeAssets[j].timestampMs > companionMultiDayGapMs) break;
         if (!visited.has(j) && areLocalNeighbors(homeAssets[curr], homeAssets[j])) {
           visited.add(j);
           queue.push(j);
         }
       }
-      // Scan forward within localGapMs
+      // Scan forward within companionMultiDayGapMs
       for (let j = curr + 1; j < homeAssets.length; j++) {
-        if (homeAssets[j].timestampMs - currTs > localGapMs) break;
+        if (homeAssets[j].timestampMs - currTs > companionMultiDayGapMs) break;
         if (!visited.has(j) && areLocalNeighbors(homeAssets[curr], homeAssets[j])) {
           visited.add(j);
           queue.push(j);
@@ -1164,6 +1455,7 @@ export function runFullPipeline(): {
     macroTripCount: rawEvents.filter((e) => e.type === 'trip').length,
     localEventCount: rawEvents.filter((e) => e.type === 'local_event').length,
     bridgedNoGpsCount,
+    peopleConsolidatedTrips,
     gpsTaggedCount: eligible.filter((e) => isValidGps(e.asset.latitude, e.asset.longitude)).length,
     mlTaggedCount: eligible.filter((e) => e.asset.smartTags.length > 0).length,
     faceTaggedCount: eligible.filter((e) => e.asset.peopleIds.length > 0).length,
@@ -1632,6 +1924,11 @@ export function runFullPipeline(): {
   savePipelineSummary(summary);
   saveSettings({ lastScanAt: nowIso });
 
+  logInfo(
+    'Pipeline',
+    `Completed in ${summary.durationMs}ms | Stage 1: ${stage1.eligibleAssets.toLocaleString()}/${stage1.totalAssets.toLocaleString()} eligible (${stage1.excludedAlreadyAlbumed} albumed, ${stage1.excludedScreenshots} screenshots) | Stage 2: Home=${stage2.homeBaseCity} (${stage2.homeBaseSource}), ${stage2.macroTripCount} trips (${stage2.peopleConsolidatedTrips ?? 0} unified via People+Dates), ${stage2.localEventCount} local events, ${stage2.bridgedNoGpsCount ?? 0} DSLR bridged | Stage 3: ${stage3.sceneSplitsDetected} splits, ${stage3.totalChaptersCreated} chapters -> ${summary.totalProposedAlbums} proposals`
+  );
+
   return {
     summary,
     clusters: getAllClusters(true),
@@ -1774,6 +2071,10 @@ export function mergeClusters(
 
   const result = getAllClusters(true).find((c) => c.id === mergedId);
   if (!result) throw new Error('Failed to create merged cluster.');
+  logInfo(
+    'Cluster',
+    `Merged ${selected.length} albums -> "${result.title}" (${result.assetIds.length} unique photos, mode: ${options.keepOriginals ? 'keep originals' : 'replace'})`
+  );
   return result;
 }
 
@@ -1949,6 +2250,11 @@ export async function syncClusterIdempotent(clusterId: string): Promise<{
     historyEntry.totalInAlbum,
     historyEntry.mode,
     historyEntry.syncedAt
+  );
+
+  logInfo(
+    'Sync',
+    `${action === 'created' ? 'Created' : 'Appended to'} album "${cluster.title}" (id: ${immichAlbumId}, +${addedCount} photos, total: ${mergedIds.length}, mode: ${historyEntry.mode})`
   );
 
   const updated = getAllClusters(true).find((c) => c.id === cluster.id)!;

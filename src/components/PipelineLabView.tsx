@@ -185,9 +185,10 @@ export function PipelineLabView({
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2 pt-1.5 border-t border-zinc-100 dark:border-white/[0.06]">
-                  <dt>Bridged DSLR / noise</dt>
+                  <dt>Bridged DSLR / unified trips</dt>
                   <dd className="font-mono tabular-nums text-zinc-900 dark:text-zinc-200">
-                    {summary.stage2.bridgedNoGpsCount ?? 0} / {summary.stage2.unclusteredNoiseCount}
+                    {summary.stage2.bridgedNoGpsCount ?? 0} /{' '}
+                    {summary.stage2.peopleConsolidatedTrips ?? 0}
                   </dd>
                 </div>
               </dl>

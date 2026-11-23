@@ -4,6 +4,7 @@ import path from 'path';
 import type { ImmichStatus, PullPhase, PullProgressState } from '../shared/types.ts';
 import { decodeImageBufferToRgba, extractColorFeaturesFromPixels } from './colorLab.ts';
 import { DATA_DIR, getAssetCount, getDb, getSettings, purgeDemoAssets, THUMBNAIL_DIR } from './db.ts';
+import { formatDurationShort, logError, logInfo, logWarn } from './logger.ts';
 
 let pullProgress: PullProgressState = {
   active: false,
@@ -36,6 +37,10 @@ export function getPullProgress(): PullProgressState {
 export function requestCancelPull(): PullProgressState {
   if (pullProgress.active) {
     cancelRequestedFlag = true;
+    logWarn(
+      'Immich',
+      `Stop & Cluster requested during ${pullProgress.phase} (${pullProgress.percent}%) — finishing current batch and clustering saved photos`
+    );
     pullProgress = {
       ...pullProgress,
       cancelRequested: true,
@@ -83,6 +88,7 @@ export function startPullProgress(label = 'Connecting to Immich'): void {
 
 export function finishPullProgress(detail: string, ingestedCount?: number): void {
   cancelRequestedFlag = false;
+  logInfo('Immich', `Pull & scan complete — ${detail}`);
   setPullProgress({
     active: false,
     phase: 'done',
@@ -98,6 +104,7 @@ export function finishPullProgress(detail: string, ingestedCount?: number): void
 
 export function failPullProgress(errorMessage: string): void {
   cancelRequestedFlag = false;
+  logError('Immich', `Pull failed: ${errorMessage}`);
   setPullProgress({
     active: false,
     phase: 'error',
@@ -611,6 +618,15 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
         : settings.maxAssetsPerPull;
     const effectiveMax = rawMax === 0 ? 150_000 : Math.min(150_000, rawMax);
     let pageSize = 1000;
+    const scopeLabel = rawMax === 0 ? 'full library' : `up to ${rawMax.toLocaleString()} photos`;
+    const dateRangeLabel =
+      options.takenAfter || options.takenBefore
+        ? ` · range ${options.takenAfter || '*'}..${options.takenBefore || '*'}`
+        : '';
+    logInfo(
+      'Immich',
+      `Connected to ${status.hostLabel || status.baseUrl} (${status.serverVersion || 'unknown version'}) — starting pull (${scopeLabel}${dateRangeLabel})`
+    );
     const excludedKeywords = settings.excludedPaths.map((p) => p.toLowerCase()).filter(Boolean);
     const screenAspectRatios = [
       16 / 9,
@@ -702,6 +718,10 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
           })
         );
       }
+      logInfo(
+        'Immich',
+        `Phase 1/5 Albums: scanned ${totalAlbums.toLocaleString()} albums (${alreadyAlbumedIds.size.toLocaleString()} already-albumed assets)`
+      );
     }
 
     // 1b. Query true total image count via GET /api/assets/statistics (never rely on per-page total=250)
@@ -725,6 +745,34 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
         // Non-fatal: older servers or proxies without /statistics will use dynamic progress
       }
     }
+
+    // 1c. Optional lookup of recognized people names via GET /api/people (non-fatal if scope omitted)
+    const personNameById = new Map<string, string>();
+    try {
+      const peopleRes = await immichFetch('/api/people?withHidden=false', {}, 10000);
+      if (peopleRes.ok) {
+        const peoplePayload = (await peopleRes.json()) as
+          | Array<{ id: string; name?: string | null }>
+          | { people?: Array<{ id: string; name?: string | null }> };
+        const list = Array.isArray(peoplePayload)
+          ? peoplePayload
+          : Array.isArray(peoplePayload?.people)
+            ? peoplePayload.people
+            : [];
+        for (const p of list) {
+          if (p?.id && typeof p.name === 'string' && p.name.trim()) {
+            personNameById.set(p.id, p.name.trim());
+          }
+        }
+      }
+    } catch {
+      // Non-fatal: fall back to inline people[].name from /api/search/metadata
+    }
+
+    logInfo(
+      'Immich',
+      `Library preflight: ${libraryImageTotal > 0 ? `${libraryImageTotal.toLocaleString()} images reported` : 'dynamic pagination'} · ${personNameById.size.toLocaleString()} named people loaded`
+    );
 
     // Prepare SQLite statements up front so EVERY metadata page is persisted immediately
     fs.mkdirSync(THUMBNAIL_DIR, { recursive: true });
@@ -819,10 +867,15 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
             : null;
 
         const peopleList = item.people || [];
-        const peopleIds = peopleList.map((p) => p.id).filter(Boolean);
-        const peopleNames = peopleList
-          .map((p) => (typeof p.name === 'string' ? p.name.trim() : ''))
-          .filter(Boolean);
+        const peopleIds: string[] = [];
+        const peopleNames: string[] = [];
+        for (const p of peopleList) {
+          if (!p?.id) continue;
+          peopleIds.push(p.id);
+          const resolvedName =
+            (typeof p.name === 'string' && p.name.trim()) || personNameById.get(p.id) || '';
+          if (resolvedName) peopleNames.push(resolvedName);
+        }
 
         const origPath = item.originalPath || `/immich/${item.originalFileName || item.id}`;
         upsertMetadata.run({
@@ -891,6 +944,7 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
     const maxPages = Math.ceil(effectiveMax / 250) + 5;
     let nextPageNum = 1;
     let savedToDbCount = 0;
+    let lastMetaLogAt = 0;
 
     for (let step = 0; step < maxPages; step++) {
       if (cancelRequestedFlag || collected.length >= effectiveMax) break;
@@ -927,6 +981,7 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
           lastErrText = await res.text().catch(() => '');
           // Fallback to pageSize=250 if an Immich server rejects size=1000 on page 1
           if (res.status === 400 && pageSize > 250 && nextPageNum === 1 && attempt === 0) {
+            logWarn('Immich', 'Server rejected page size=1000 (HTTP 400); falling back to size=250');
             pageSize = 250;
             continue;
           }
@@ -947,6 +1002,10 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
             `Immich /api/search/metadata failed${res ? ` (HTTP ${res.status})` : ''}${lastErrText ? `: ${lastErrText.slice(0, 140)}` : ''}`
           );
         }
+        logWarn(
+          'Immich',
+          `Metadata pagination stopped early on page ${nextPageNum} after ${collected.length.toLocaleString()} photos (${lastErrText || 'HTTP error'})`
+        );
         break;
       }
 
@@ -972,6 +1031,10 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
 
       // Guard against Immich nextPage loop bug (e.g. repeated identical page)
       if (pageNewItems.length === 0) {
+        logWarn(
+          'Immich',
+          `Metadata pagination returned 0 new items on page ${nextPageNum}; stopping pagination loop`
+        );
         break;
       }
 
@@ -1004,6 +1067,16 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
           ? Math.round((estimatedTotal - collected.length) / rate)
           : null;
 
+      const nowMs = Date.now();
+      if (nextPageNum === 1 || nextPageNum % 5 === 0 || nowMs - lastMetaLogAt >= 10_000) {
+        lastMetaLogAt = nowMs;
+        const etaStr = formatDurationShort(etaSec);
+        logInfo(
+          'Immich',
+          `Phase 2/5 Metadata: page ${nextPageNum} · ${collected.length.toLocaleString()}${estimatedTotal > 0 ? ` / ${estimatedTotal.toLocaleString()}` : ''} saved to SQLite (${Math.round(pct)}% · ${Math.round(rate)}/s${etaStr ? ` · ETA ~${etaStr}` : ''})`
+        );
+      }
+
       setPullProgress({
         active: true,
         phase: 'metadata',
@@ -1025,6 +1098,11 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
       nextPageNum =
         Number.isFinite(parsedNext) && parsedNext > nextPageNum ? parsedNext : nextPageNum + 1;
     }
+
+    logInfo(
+      'Immich',
+      `Phase 2/5 Metadata complete: ${collected.length.toLocaleString()} photos persisted to SQLite in ${((Date.now() - metaStartedAt) / 1000).toFixed(1)}s`
+    );
 
     // 3. Query CLIP Smart Search occasion prompts (36% -> 44%) and persist tags immediately
     const tagMap = new Map<string, Set<string>>();
@@ -1099,6 +1177,10 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
           }
         })();
       }
+      logInfo(
+        'Immich',
+        `Phase 3/5 Smart Search: ${promptsDone}/${OCCASION_PROMPTS.length} CLIP prompts queried · ${smartTagsMatched.toLocaleString()} matches across ${tagMap.size.toLocaleString()} photos`
+      );
     }
 
     // 4. Download thumbnails + extract CIELAB color features for uncached eligible photos (44% -> 92%)
@@ -1111,6 +1193,10 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
     let processedCount = 0;
     let cachedCount = 0;
     let skippedExcludedCount = 0;
+    let consecutiveWebpToPreview = 0;
+    let preferPreviewDirectly = false;
+    let lastThumbLogAt = 0;
+    let lastThumbLogCount = 0;
     const thumbStartedAt = Date.now();
 
     if (!cancelRequestedFlag && totalAssets > 0) {
@@ -1178,14 +1264,15 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
                 }
               } else {
                 try {
+                  const initialSize = preferPreviewDirectly ? 'preview' : 'thumbnail';
                   const thumbRes = await immichFetch(
-                    `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=thumbnail`,
+                    `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=${initialSize}`,
                     { headers: { Accept: 'image/jpeg,image/png,image/webp,*/*' } },
                     15000
                   );
                   if (thumbRes.ok) {
                     let buf = Buffer.from(await thumbRes.arrayBuffer());
-                    if (isWebpBuffer(buf)) {
+                    if (!preferPreviewDirectly && isWebpBuffer(buf)) {
                       try {
                         const previewRes = await immichFetch(
                           `/api/assets/${encodeURIComponent(item.id)}/thumbnail?size=preview`,
@@ -1196,6 +1283,14 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
                           const previewBuf = Buffer.from(await previewRes.arrayBuffer());
                           if (!isWebpBuffer(previewBuf) && previewBuf.length > 0) {
                             buf = previewBuf;
+                            consecutiveWebpToPreview++;
+                            if (consecutiveWebpToPreview >= 3 && !preferPreviewDirectly) {
+                              preferPreviewDirectly = true;
+                              logInfo(
+                                'Immich',
+                                'Detected WebP thumbnails on server — switching directly to JPEG previews (saves 1 request/photo)'
+                              );
+                            }
                           }
                         }
                       } catch {
@@ -1276,10 +1371,30 @@ export async function ingestFromLiveImmich(options: ImmichIngestOptions = {}): P
           ingestedCount: savedToDbCount,
           etaSeconds: etaSec,
         });
+
+        const nowThumbMs = Date.now();
+        if (
+          processedCount === totalAssets ||
+          processedCount - lastThumbLogCount >= 500 ||
+          nowThumbMs - lastThumbLogAt >= 10_000
+        ) {
+          lastThumbLogAt = nowThumbMs;
+          lastThumbLogCount = processedCount;
+          const etaStr = formatDurationShort(etaSec);
+          logInfo(
+            'Immich',
+            `Phase 4/5 Thumbnails & CIELAB: ${processedCount.toLocaleString()} / ${totalAssets.toLocaleString()} (${Math.round(pct)}% · ${cachedCount.toLocaleString()} cached · ${skippedExcludedCount.toLocaleString()} skipped · ${rate.toFixed(1)}/s${etaStr ? ` · ETA ~${etaStr}` : ''})`
+          );
+        }
       }
+      logInfo(
+        'Immich',
+        `Phase 4/5 Thumbnails & CIELAB complete: ${processedCount.toLocaleString()} / ${totalAssets.toLocaleString()} processed in ${((Date.now() - thumbStartedAt) / 1000).toFixed(1)}s`
+      );
     }
 
     const totalInDb = getAssetCount();
+    logInfo('Immich', `Phase 5/5 Clustering: running multi-signal pipeline on ${totalInDb.toLocaleString()} indexed photos...`);
     setPullProgress({
       active: true,
       phase: 'clustering',

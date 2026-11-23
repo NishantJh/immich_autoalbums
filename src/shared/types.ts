@@ -180,6 +180,7 @@ export interface Stage2Stats {
   macroTripCount: number;
   localEventCount: number;
   bridgedNoGpsCount?: number;
+  peopleConsolidatedTrips?: number;
   gpsTaggedCount?: number;
   mlTaggedCount?: number;
   faceTaggedCount?: number;

@@ -43,6 +43,7 @@ import {
   syncClusterIdempotent,
 } from './src/server/pipeline.ts';
 import { computeNearbyRenameSuggestions } from './src/server/renamePropagation.ts';
+import { logError, logInfo } from './src/server/logger.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -110,6 +111,10 @@ async function startServer() {
       }
 
       const status = await saveImmichConnection(baseUrl, apiKey);
+      logInfo(
+        'Immich',
+        `Saved connection to ${status.hostLabel || baseUrl} (reachable: ${status.reachable}${status.serverVersion ? `, ${status.serverVersion}` : ''})`
+      );
       res.json({ status });
     } catch (err) {
       res.status(400).json({
@@ -121,6 +126,7 @@ async function startServer() {
   // Clear saved Immich credentials (falls back to env vars if configured)
   app.delete('/api/immich/config', async (_req, res) => {
     const status = await clearSavedImmichConnection();
+    logInfo('Immich', 'Disconnected saved Immich server credentials');
     res.json({ status });
   });
 
@@ -722,11 +728,14 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ChromaCluster server listening on http://0.0.0.0:${PORT}`);
+    logInfo(
+      'Server',
+      `ChromaCluster listening on http://0.0.0.0:${PORT} (${isProd ? 'production' : 'dev'} · SQLite cache: ${getAssetCount().toLocaleString()} photos)`
+    );
   });
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start ChromaCluster server:', err);
+  logError('Server', `Failed to start ChromaCluster: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 });
